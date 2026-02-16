@@ -88,7 +88,7 @@ def _iter_display_list_exec(data: bytes, dl_off: int = 8, max_cmds: int = 200000
         steps += 1
 
         if op == 0xDE:  # G_DL
-            target = _resolve_segment_offset(data, w1)
+            target = _resolve_dl_addr(data, w1)
             if target is not None and 0 <= target <= (len(data) - 8):
                 stack.append(off + 8)
                 off = target
@@ -110,6 +110,17 @@ def _resolve_segment_offset(data: bytes, seg_addr: int) -> Optional[int]:
     # decompressed blob; treat them as local when in range.
     if seg in (0x08, 0x09, 0x0A, 0x0B) and 0 <= off < len(data):
         return off
+    return None
+
+
+def _resolve_dl_addr(data: bytes, seg_addr: int) -> Optional[int]:
+    # Prefer strict segment decode first, then best-effort local low-24 fallback.
+    off = _resolve_segment_offset(data, seg_addr)
+    if off is not None:
+        return off
+    lo = seg_addr & 0x00FFFFFF
+    if 0 <= lo < len(data):
+        return lo
     return None
 
 
@@ -649,6 +660,118 @@ def extract_ci4_texture(data: bytes) -> Tuple[List[Tuple[int, int, int, int]], i
     return pixels, width, height
 
 
+def _extract_ci4_texture_at(data: bytes, pal_off: int, img_off: int, width: int = 32, height: int = 32) -> Tuple[List[Tuple[int, int, int, int]], int, int]:
+    if pal_off < 0 or (pal_off + 32) > len(data):
+        raise ValueError("palette region out of range")
+    if img_off < 0 or (img_off + (width * height) // 2) > len(data):
+        raise ValueError("image region out of range")
+    palette: List[Tuple[int, int, int, int]] = []
+    for i in range(16):
+        p = be32(b"\x00\x00" + data[pal_off + i * 2 : pal_off + i * 2 + 2], 0) & 0xFFFF
+        palette.append(rgba5551_to_rgba8888(p))
+    pixels: List[Tuple[int, int, int, int]] = []
+    blob = data[img_off : img_off + (width * height) // 2]
+    for byte in blob:
+        hi = (byte >> 4) & 0xF
+        lo = byte & 0xF
+        pixels.append(palette[hi])
+        pixels.append(palette[lo])
+    return pixels, width, height
+
+
+def _decode_settilesize_wh(w1: int) -> Optional[Tuple[int, int]]:
+    # F2 (G_SETTILESIZE): w1 packs lrs/lrt in 10.2 fixed-ish fields.
+    lrs = (w1 >> 12) & 0x0FFF
+    lrt = w1 & 0x0FFF
+    width = (lrs >> 2) + 1
+    height = (lrt >> 2) + 1
+    if width <= 0 or height <= 0:
+        return None
+    if width > 512 or height > 512:
+        return None
+    return width, height
+
+
+def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[int, int, int, int]], int, int]:
+    # Heuristic decode from RDP command stream:
+    # - FD100000 commonly points to RGBA16 TLUT (16 entries)
+    # - FD500000 / FD900000 commonly point to CI4 image payloads
+    cmds = list(_iter_display_list_exec(data, dl_off=dl_off))
+    pal_offs: List[int] = []
+    img_offs: List[int] = []
+    current_pal: Optional[int] = None
+    current_img: Optional[int] = None
+    current_wh: Optional[Tuple[int, int]] = None
+    usage: Dict[Tuple[int, int, int, int], int] = {}
+
+    for _off, op, w0, w1 in cmds:
+        if op == 0xFD:
+            addr = _resolve_dl_addr(data, w1)
+            if addr is None:
+                continue
+            key = (w0 >> 20) & 0xF
+            if key == 0x1 and (addr + 32) <= len(data):
+                pal_offs.append(addr)
+                current_pal = addr
+            elif key in (0x5, 0x9) and (addr + 32) <= len(data):
+                img_offs.append(addr)
+                current_img = addr
+            continue
+
+        if op == 0xF2:
+            wh = _decode_settilesize_wh(w1)
+            if wh is not None:
+                current_wh = wh
+            continue
+
+        if op in (0x05, 0x06):
+            if current_pal is None or current_img is None:
+                continue
+            width, height = current_wh if current_wh is not None else (32, 32)
+            # CI4 image payload must fit in current blob.
+            bytes_needed = (width * height + 1) // 2
+            if width <= 0 or height <= 0 or (current_img + bytes_needed) > len(data):
+                continue
+            tri_inc = 2 if op == 0x06 else 1
+            key = (current_pal, current_img, width, height)
+            usage[key] = usage.get(key, 0) + tri_inc
+
+    if not pal_offs or not img_offs:
+        raise ValueError("no CI4 palette/image addresses inferred from DL")
+
+    candidate_dims: List[Tuple[int, int]] = [(32, 32), (16, 16), (64, 32), (32, 64), (64, 64), (128, 128)]
+
+    candidates: List[Tuple[int, int, int, int, int]] = []
+    if usage:
+        # Prefer state pair that was active for most drawn triangles.
+        for (pal, img, width, height), tri_hits in usage.items():
+            candidates.append((tri_hits, pal, img, width, height))
+        candidates.sort(reverse=True)
+    else:
+        # Fallback to most recent palette/image pair; this tends to reflect
+        # final bound state in compact model display lists.
+        pal = pal_offs[-1]
+        img = img_offs[-1]
+        for width, height in candidate_dims:
+            candidates.append((0, pal, img, width, height))
+
+    # Try best-ranked pair first, then alternate dimensions if needed.
+    for _hits, pal, img, width, height in candidates:
+        trial_dims = [(width, height)] + [d for d in candidate_dims if d != (width, height)]
+        for tw, th in trial_dims:
+            bytes_needed = (tw * th + 1) // 2
+            if (img + bytes_needed) > len(data):
+                continue
+            if (pal + 32) > len(data):
+                continue
+            try:
+                return _extract_ci4_texture_at(data, pal, img, tw, th)
+            except Exception:
+                continue
+
+    raise ValueError("failed to decode CI4 texture from inferred DL palette/image state")
+
+
 def write_obj_mtl(
     out_base: pathlib.Path,
     verts: Sequence[Vtx],
@@ -712,7 +835,10 @@ def cmd_export_model(args: argparse.Namespace) -> int:
     if args.texture:
         if Image is None:
             raise RuntimeError("Pillow is required for PNG texture export: pip install pillow")
-        pixels, w, h = extract_ci4_texture(blob)
+        try:
+            pixels, w, h = extract_ci4_texture_from_dl(blob, dl_off=8)
+        except Exception:
+            pixels, w, h = extract_ci4_texture(blob)
         img = Image.new("RGBA", (w, h))
         img.putdata(pixels)
         img.save(out_base.with_suffix(".png"))
@@ -868,7 +994,11 @@ def _export_one_model(
     wrote_texture = False
     if texture and Image is not None:
         try:
-            pixels, w, h = extract_ci4_texture(chunk)
+            chunk_tex = rom[base_used : base_used + window + 16]
+            try:
+                pixels, w, h = extract_ci4_texture_from_dl(chunk_tex, dl_off=dl_used)
+            except Exception:
+                pixels, w, h = extract_ci4_texture(chunk_tex)
             img = Image.new("RGBA", (w, h))
             img.putdata(pixels)
             img.save(out_base.with_suffix(".png"))
@@ -1494,12 +1624,15 @@ def _u16_dup_score(samples: Sequence[int], w: int, h: int) -> float:
 
 
 def _u16_layout_score(samples: Sequence[int], w: int, h: int) -> float:
+    # Use absolute neighbor difference to avoid range-normalization bias.
+    # Heightmaps should be smooth relative to the 16-bit depth (65535).
     smooth = _neighbor_absdiff_score(samples, w, h)
     dup = _u16_dup_score(samples, w, h)
-    # Prefer square-ish layouts unless another shape is significantly better.
+    # Prefer square-ish layouts.
     aspect_penalty = 0.08 * abs(math.log2(max(w, h) / max(1, min(w, h))))
-    # Lower smoothness is good for terrain; too-similar halves are suspicious.
-    return smooth + aspect_penalty + (0.5 * max(0.0, 0.1 - dup))
+    # Penalty for noise and suspiciously high duplication.
+    # Lower is better.
+    return (10.0 * smooth) + aspect_penalty + (0.5 * max(0.0, 0.1 - dup))
 
 
 def _parse_dim_list(spec: str, total_px: int) -> List[Tuple[int, int]]:
@@ -1529,6 +1662,7 @@ def _parse_dim_list(spec: str, total_px: int) -> List[Tuple[int, int]]:
 
 def _neighbor_absdiff_score(samples: Sequence[int], w: int, h: int) -> float:
     # Heightmaps should be relatively smooth between adjacent samples.
+    # Returns score normalized to 0.0-1.0 over the 16-bit range.
     total = 0
     cnt = 0
     for y in range(h):
@@ -1543,11 +1677,11 @@ def _neighbor_absdiff_score(samples: Sequence[int], w: int, h: int) -> float:
                 total += abs(v - samples[i + w])
                 cnt += 1
     if cnt <= 0:
-        return 1e9
-    mn = min(samples)
-    mx = max(samples)
-    rng = max(1, mx - mn)
-    return (total / cnt) / rng
+        return 1.0
+    # Normalize by the theoretical MAX range of depth (65535 for u16)
+    # This prevents grainy/swapped data with high local volatility from
+    # scoring well just because it ALSO has a large global range.
+    return (total / cnt) / 65535.0
 
 
 def _write_l8(path: pathlib.Path, w: int, h: int, data: Sequence[int]) -> None:
@@ -1746,84 +1880,119 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             be = [struct.unpack_from(">H", dec, i * 2)[0] for i in range(n)]
             le = [struct.unpack_from("<H", dec, i * 2)[0] for i in range(n)]
 
+            hi = [dec[i * 2] for i in range(n)]
+            lo = [dec[i * 2 + 1] for i in range(n)]
+
             def _u16_variants(vals: Sequence[int], tag: str) -> List[Dict[str, object]]:
                 rows: List[Dict[str, object]] = []
+                # If interpreting as 8-bit bytes (hi/lo), we scale to 16-bit range for consistent scoring.
+                is_8bit = tag in ("hi", "lo")
+                scale = 256 if is_8bit else 1
+
                 for (w, h) in u16_dims:
-                    base = list(vals)
-                    rows.append({"name": f"{tag}_linear_{w}x{h}", "w": w, "h": h, "pixels": base, "score": _u16_layout_score(base, w, h)})
+                    base = [v * scale for v in vals]
+                    rows.append({
+                        "name": f"{tag}_linear_{w}x{h}",
+                        "w": w, "h": h,
+                        "pixels": base,
+                        "score": _u16_layout_score(base, w, h),
+                        "is_8bit": is_8bit,
+                    })
                     for ts in [2, 4, 8, 16, 32]:
                         if (w % ts) == 0 and (h % ts) == 0:
                             p = _untile_linear(base, w, h, ts)
-                            rows.append(
-                                {
-                                    "name": f"{tag}_untile_linear_ts{ts}_{w}x{h}",
-                                    "w": w,
-                                    "h": h,
-                                    "pixels": p,
-                                    "score": _u16_layout_score(p, w, h),
-                                }
-                            )
+                            rows.append({
+                                "name": f"{tag}_untile_linear_ts{ts}_{w}x{h}",
+                                "w": w, "h": h,
+                                "pixels": p,
+                                "score": _u16_layout_score(p, w, h),
+                                "is_8bit": is_8bit,
+                            })
                     for ts in [4, 8, 16]:
                         if (w % ts) == 0 and (h % ts) == 0:
                             p = _untile_morton(base, w, h, ts)
-                            rows.append(
-                                {
-                                    "name": f"{tag}_untile_morton_ts{ts}_{w}x{h}",
-                                    "w": w,
-                                    "h": h,
-                                    "pixels": p,
-                                    "score": _u16_layout_score(p, w, h),
-                                }
-                            )
+                            rows.append({
+                                "name": f"{tag}_untile_morton_ts{ts}_{w}x{h}",
+                                "w": w, "h": h,
+                                "pixels": p,
+                                "score": _u16_layout_score(p, w, h),
+                                "is_8bit": is_8bit,
+                            })
                 rows.sort(key=lambda r: float(r["score"]))
                 return rows
 
             be_vars = _u16_variants(be, "be")
             le_vars = _u16_variants(le, "le")
-            be_best = be_vars[0]
-            le_best = le_vars[0]
+            hi_vars = _u16_variants(hi, "hi")
+            lo_vars = _u16_variants(lo, "lo")
 
-            be_png = out_dir / f"{off:08X}_light_be.png"
-            le_png = out_dir / f"{off:08X}_height_le.png"
-            _write_l8(be_png, int(be_best["w"]), int(be_best["h"]), _u16_to_norm8(be_best["pixels"]))  # type: ignore[arg-type]
-            _write_l8(le_png, int(le_best["w"]), int(le_best["h"]), _u16_to_norm8(le_best["pixels"]))  # type: ignore[arg-type]
+            # Collate all and pick the top two distinct "roles"
+            all_v = sorted(be_vars + le_vars + hi_vars + lo_vars, key=lambda x: float(x["score"]))
+
+            # Export best overall and best runner-up from a different tag group if possible
+            best_v1 = all_v[0]
+            tag1 = best_v1["name"].split("_")[0]
+
+            # Find best v2 that isn't the same prefix (e.g. if BE is best, find best LE/HI/LO)
+            best_v2 = next((v for v in all_v if not v["name"].startswith(tag1)), all_v[min(1, len(all_v)-1)])
+
+            be_png = out_dir / f"{off:08X}_layer1_{best_v1['name']}.png"
+            le_png = out_dir / f"{off:08X}_layer2_{best_v2['name']}.png"
+
+            _write_l8(be_png, int(best_v1["w"]), int(best_v1["h"]), _u16_to_norm8(best_v1["pixels"]))
+            _write_l8(le_png, int(best_v2["w"]), int(best_v2["h"]), _u16_to_norm8(best_v2["pixels"]))
+
+            # Store info for this record
+            rec_detail = {
+                "offset": off,
+                "layer1_variant": best_v1["name"],
+                "layer2_variant": best_v2["name"],
+                "score_layer1": best_v1["score"],
+                "score_layer2": best_v2["score"],
+                "layer1_png": str(be_png),
+                "layer2_png": str(le_png),
+            }
 
             be_saved: List[Dict[str, object]] = []
             for v in be_vars[:u16_topk]:
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
-                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))  # type: ignore[arg-type]
+                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 be_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
 
             le_saved: List[Dict[str, object]] = []
             for v in le_vars[:u16_topk]:
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
-                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))  # type: ignore[arg-type]
+                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 le_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
 
             # Heuristic: very low unique value count implies indexed/paint-like data.
             be_unique = len(set(be))
             le_unique = len(set(le))
+            # Use the best scores for classification
             if be_unique <= 96 and le_unique <= 96:
                 u16_class = "indexed_u16_paintlike"
-            elif float(le_best["score"]) > 0.22 and float(be_best["score"]) < 0.10:
-                u16_class = "lightmap_or_indexed_noisy_height"
+            elif float(all_v[0]["score"]) > 0.15: # Overall noisy
+                u16_class = "noisy_or_unknown_u16"
             else:
                 u16_class = "terrain_u16_candidate"
+                
             u16_records.append(
                 {
                     "offset": off,
                     "decompressed_size": size,
                     "raw_md5": _md5_hex(dec),
-                    "light_be_png": str(be_png),
-                    "height_le_png": str(le_png),
-                    "score_be": float(be_best["score"]),
-                    "score_le": float(le_best["score"]),
-                    "light_variant": be_best["name"],
-                    "height_variant": le_best["name"],
-                    "light_dims": [int(be_best["w"]), int(be_best["h"])],
-                    "height_dims": [int(le_best["w"]), int(le_best["h"])],
-                    "light_variants": be_saved,
-                    "height_variants": le_saved,
+                    "light_be_png": str(be_png), # Keep for compat
+                    "height_le_png": str(le_png), # Keep for compat
+                    "score_be": float(be_vars[0]["score"]),
+                    "score_le": float(le_vars[0]["score"]),
+                    "score_hi": float(hi_vars[0]["score"]),
+                    "score_lo": float(lo_vars[0]["score"]),
+                    "best_variant": best_v1["name"],
+                    "best_score": best_v1["score"],
+                    "layer1_dims": [int(best_v1["w"]), int(best_v1["h"])],
+                    "layer2_dims": [int(best_v2["w"]), int(best_v2["h"])],
+                    "be_variants": be_saved,
+                    "le_variants": le_saved,
                     "be_unique_values": be_unique,
                     "le_unique_values": le_unique,
                     "u16_class": u16_class,

@@ -96,6 +96,8 @@ N64-exclusive BZN files to prioritize:
 - Current active focus is model extraction and model texture correctness.
 - Terrain work is paused at `extract_out\terrain_all_tuned_v2` unless explicitly reopened.
 - Model format behavior and current assumptions are documented in `MODEL_FORMAT_NOTES.md`.
+- Texture decode path is DL-driven for CI4 (active palette/image + tile size), with fixed-offset behavior only as fallback.
+- Models often bind many small tiled textures; current OBJ export still emits a single dominant texture PNG per mesh.
 - `models_yay0_focus_v2` is a broad research dump (includes noisy helper/internal signatures); use `models_yay0_blender_v2` for Blender import first.
 - Do not assume every `32768` chunk is a true terrain height/light pair.
 - Use manifest data (not filename guesses) for pipeline decisions.

@@ -21,6 +21,7 @@ Working ROM path used during analysis:
 ## Quick Status
 - **Yay0 decompression is implemented and stable**.
 - **Model parsing is working for known format samples** (RSP vertex cache semantics fixed).
+- **Model texture extraction now uses DL-driven CI4 state** (palette/image pointers + tile size inferred from commands when present).
 - **Terrain extraction has a stable v2 baseline** (square-first layouts + improved paint scoring).
 - **BZN containers are extracted** and reference fields are indexed.
 
@@ -189,6 +190,13 @@ Latest observed counts (from v2 full run):
   - `extract_out/models_romscan_v1/manifest.json` (`182` exported, `132` failed)
   - `extract_out/model_extraction_summary_v2.json` (combined run stats)
   - Note: `models_yay0_focus_v2` intentionally includes many low-tri/internal signatures and is not Blender-ready as-is.
+
+## Model Texture Notes (Current)
+- CI4 texture decode now prefers palette/image pairs that are active during triangle draw commands in the executed DL stream.
+- Palette and image addresses are resolved from segmented pointers first, then low-24 local offsets as fallback.
+- Tile width/height is inferred from `G_SETTILESIZE` when available; fallback size candidates are tried if needed.
+- This improves color correctness versus fixed-offset extraction, especially where multiple `FD` texture loads exist in one model stream.
+- Current OBJ export still writes one material/PNG per mesh (dominant inferred tile). Many game models use multiple tiny tiled textures across sub-meshes, so full per-material texture reconstruction is still pending.
 
 ## N64-Exclusive Map Focus
 Known high-priority extracted BZN containers:
