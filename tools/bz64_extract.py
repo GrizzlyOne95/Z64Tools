@@ -53,6 +53,90 @@ class Tri:
 
 
 TexState = Tuple[int, int, int, int, int, int, int]
+UvInfo = Tuple[int, int, int, int]
+
+
+def _tex_scale_to_div(scale: int) -> int:
+    # Map G_TEXTURE scale (16-bit) to an effective divisor for s/t.
+    # Common defaults use 0x8000, which maps closer to a 2048 divisor in this
+    # microcode path (legacy 4096 produced consistently half-sized UV spans).
+    if scale <= 0:
+        return 2048
+    return max(1, int(round(2048.0 * (0x8000 / float(scale)))))
+
+
+def _apply_shift_to_div(div: int, shift: int) -> int:
+    # RDP shift: 0..10 shift right, 11..15 shift left by (16-shift).
+    if shift <= 10:
+        return div * (1 << shift)
+    return max(1, div // (1 << (16 - shift)))
+
+
+def _convert_loadblock_texels(texels: int, load_siz: Optional[int], render_siz: Optional[int]) -> int:
+    if texels <= 0:
+        return texels
+    if load_siz is None or render_siz is None:
+        return texels
+    # siz encodes bits-per-texel as 4,8,16,32 for 0..3.
+    load_bpt = 4 << int(load_siz)
+    render_bpt = 4 << int(render_siz)
+    if load_bpt <= 0 or render_bpt <= 0:
+        return texels
+    return max(1, int(round(float(texels) * (float(load_bpt) / float(render_bpt)))))
+
+
+def _tri_uv_area(va: Vtx, vb: Vtx, vc: Vtx, u_div: float, v_div: float, u_off: float, v_off: float) -> float:
+    au = (va.s - u_off) / u_div
+    av = (va.t - v_off) / v_div
+    bu = (vb.s - u_off) / u_div
+    bv = (vb.t - v_off) / v_div
+    cu = (vc.s - u_off) / u_div
+    cv = (vc.t - v_off) / v_div
+    return abs((bu - au) * (cv - av) - (cu - au) * (bv - av)) * 0.5
+
+
+def _tri_uv_areas(verts: Sequence[Vtx], tris: Sequence[Tri], tri_uv_info: Sequence[UvInfo]) -> List[float]:
+    areas: List[float] = []
+    for i, t in enumerate(tris):
+        info = tri_uv_info[i] if i < len(tri_uv_info) else (4096, 4096, 0, 0)
+        areas.append(
+            _tri_uv_area(
+                verts[t.i0],
+                verts[t.i1],
+                verts[t.i2],
+                float(info[0]),
+                float(info[1]),
+                float(info[2]),
+                float(info[3]),
+            )
+        )
+    return areas
+
+
+def _uv_out_of_range_ratio(
+    verts: Sequence[Vtx],
+    tris: Sequence[Tri],
+    tri_uv_info: Sequence[UvInfo],
+    limit: float = 8.0,
+) -> float:
+    total = 0
+    out = 0
+    for i, t in enumerate(tris):
+        info = tri_uv_info[i] if i < len(tri_uv_info) else (4096, 4096, 0, 0)
+        u_div = float(info[0])
+        v_div = float(info[1])
+        u_off = float(info[2])
+        v_off = float(info[3])
+        for vi in (t.i0, t.i1, t.i2):
+            v = verts[vi]
+            u = (v.s - u_off) / u_div
+            vv = (v.t - v_off) / v_div
+            total += 1
+            if abs(u) > limit or abs(vv) > limit:
+                out += 1
+    if total == 0:
+        return 0.0
+    return out / total
 
 
 def be32(b: bytes, off: int) -> int:
@@ -77,7 +161,12 @@ def parse_display_list(data: bytes, dl_off: int = 8) -> List[Tuple[int, int, int
     return cmds
 
 
-def _iter_display_list_exec(data: bytes, dl_off: int = 8, max_cmds: int = 200000) -> Iterable[Tuple[int, int, int, int]]:
+def _iter_display_list_exec(
+    data: bytes,
+    dl_off: int = 8,
+    max_cmds: int = 200000,
+    seg_bases: Optional[Dict[int, int]] = None,
+) -> Iterable[Tuple[int, int, int, int]]:
     # Execute nested display lists via G_DL calls so geometry commands are read
     # in the same flow as the RSP command stream.
     stack: List[int] = []
@@ -90,8 +179,11 @@ def _iter_display_list_exec(data: bytes, dl_off: int = 8, max_cmds: int = 200000
         yield (off, op, w0, w1)
         steps += 1
 
+        if seg_bases is not None and op == 0xDB:  # G_MOVEWORD (segment base updates)
+            _update_segment_bases(seg_bases, w0, w1, len(data))
+
         if op == 0xDE:  # G_DL
-            target = _resolve_dl_addr(data, w1)
+            target = _resolve_dl_addr(data, w1, seg_bases=seg_bases)
             if target is not None and 0 <= target <= (len(data) - 8):
                 stack.append(off + 8)
                 off = target
@@ -106,9 +198,19 @@ def _iter_display_list_exec(data: bytes, dl_off: int = 8, max_cmds: int = 200000
         off += 8
 
 
-def _resolve_segment_offset(data: bytes, seg_addr: int) -> Optional[int]:
+def _resolve_segment_offset(data: bytes, seg_addr: int, seg_bases: Optional[Dict[int, int]] = None) -> Optional[int]:
     seg = (seg_addr >> 24) & 0xFF
     off = seg_addr & 0x00FFFFFF
+    if seg_bases is not None:
+        base = seg_bases.get(seg)
+        if base is not None:
+            target = base + off
+            if 0 <= target < len(data):
+                return target
+        # Heuristic: if the offset is already in-range, treat this segment as base 0.
+        if 0 <= off < len(data):
+            seg_bases[seg] = 0
+            return off
     # In current captures, segment ids 0x08+ often point into the same
     # decompressed blob; treat them as local when in range.
     if seg in (0x08, 0x09, 0x0A, 0x0B) and 0 <= off < len(data):
@@ -116,15 +218,28 @@ def _resolve_segment_offset(data: bytes, seg_addr: int) -> Optional[int]:
     return None
 
 
-def _resolve_dl_addr(data: bytes, seg_addr: int) -> Optional[int]:
+def _resolve_dl_addr(data: bytes, seg_addr: int, seg_bases: Optional[Dict[int, int]] = None) -> Optional[int]:
     # Prefer strict segment decode first, then best-effort local low-24 fallback.
-    off = _resolve_segment_offset(data, seg_addr)
+    off = _resolve_segment_offset(data, seg_addr, seg_bases=seg_bases)
     if off is not None:
         return off
     lo = seg_addr & 0x00FFFFFF
     if 0 <= lo < len(data):
         return lo
     return None
+
+
+def _update_segment_bases(seg_bases: Dict[int, int], w0: int, w1: int, data_len: int) -> None:
+    # gSPSegment is encoded as G_MOVEWORD with index G_MW_SEGMENT (0x06).
+    index = (w0 >> 16) & 0xFF
+    if index != 0x06:
+        return
+    seg = (w0 & 0xFFFF) // 4
+    if seg < 0 or seg > 0x0F:
+        return
+    base = w1 & 0x00FFFFFF
+    if 0 <= base < data_len:
+        seg_bases[seg] = base
 
 
 def iter_model_headers(rom: bytes) -> Iterable[int]:
@@ -147,7 +262,7 @@ def scan_rom(rom: bytes) -> Dict[str, object]:
             continue
         ops = {c[1] for c in cmds}
         # Require a minimal plausible model display list profile.
-        if 0xDF in ops and 0x01 in ops and 0x05 in ops:
+        if 0xDF in ops and 0x01 in ops and (0x05 in ops or 0x06 in ops or 0x07 in ops):
             model_offsets.append(off)
     return {
         "model_header_count": len(model_offsets),
@@ -296,7 +411,8 @@ def _apply_mtx(v: Vtx, m: Sequence[Sequence[float]]) -> Vtx:
 
 
 def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[List[Vtx], List[Tri], Dict[str, int]]:
-    cmds = list(_iter_display_list_exec(data, dl_off=dl_off))
+    seg_bases: Dict[int, int] = {}
+    cmds = list(_iter_display_list_exec(data, dl_off=dl_off, seg_bases=seg_bases))
     if not cmds:
         raise ValueError("No display-list commands found")
 
@@ -308,6 +424,8 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
     de_count = 0
     external_matrix_refs = 0
     external_dl_refs = 0
+    unresolved_setimg = 0
+    unresolved_setimg = 0
 
     # RSP vertex cache slots. 0..31 are usually used; keep extra space for safety.
     cache: List[Optional[Vtx]] = [None] * 64
@@ -322,7 +440,7 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
             # matrix directly to OBJ vertex positions causes severe distortion.
             if (flags & 0x03) == 0x03:
                 continue
-            mtx_off = _resolve_segment_offset(data, w1)
+            mtx_off = _resolve_segment_offset(data, w1, seg_bases=seg_bases)
             if mtx_off is None:
                 external_matrix_refs += 1
                 continue
@@ -343,7 +461,7 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
 
         if op == 0xDE:  # G_DL
             de_count += 1
-            if _resolve_segment_offset(data, w1) is None:
+            if _resolve_segment_offset(data, w1, seg_bases=seg_bases) is None:
                 external_dl_refs += 1
             continue
 
@@ -358,7 +476,7 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
             if n <= 0 or v0 < 0:
                 continue
 
-            voff = _resolve_segment_offset(data, w1)
+            voff = _resolve_segment_offset(data, w1, seg_bases=seg_bases)
             if voff is None:
                 continue
             block_verts = parse_vertices(data, voff, n)
@@ -436,6 +554,41 @@ def parse_model(data: bytes, dl_off: int = 8, tri_div2: bool = True) -> Tuple[Li
                 all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
             continue
 
+        if op == 0x07:  # QUAD (best-effort: two triangles)
+            if tri_div2:
+                a = ((w0 >> 16) & 0xFF) // 2
+                b = ((w0 >> 8) & 0xFF) // 2
+                c = (w0 & 0xFF) // 2
+                d = ((w1 >> 16) & 0xFF) // 2
+            else:
+                a = (w0 >> 16) & 0xFF
+                b = (w0 >> 8) & 0xFF
+                c = w0 & 0xFF
+                d = (w1 >> 16) & 0xFF
+            for i0, i1, i2 in ((a, b, c), (a, c, d)):
+                if i0 >= len(cache) or i1 >= len(cache) or i2 >= len(cache):
+                    continue
+                va = cache[i0]
+                vb = cache[i1]
+                vc = cache[i2]
+                if va is None or vb is None or vc is None:
+                    continue
+                tv = [_apply_mtx(va, current_mtx), _apply_mtx(vb, current_mtx), _apply_mtx(vc, current_mtx)]
+                idxs: List[int] = []
+                for vv in tv:
+                    key = (vv.x, vv.y, vv.z, vv.s, vv.t, vv.r, vv.g, vv.b, vv.a)
+                    gi = vert_lut.get(key)
+                    if gi is None:
+                        gi = len(all_verts)
+                        all_verts.append(vv)
+                        vert_lut[key] = gi
+                    idxs.append(gi)
+                all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
+            continue
+
+        if op == 0xBE:  # G_CULLDL (ignored)
+            continue
+
     stats: Dict[str, int] = {
         "tri_count": 0,
         "vert_count": 0,
@@ -454,20 +607,24 @@ def parse_model_with_texstates(
     data: bytes,
     dl_off: int = 8,
     tri_div2: bool = True,
-) -> Tuple[List[Vtx], List[Tri], Dict[str, int], List[Optional[TexState]]]:
-    cmds = list(_iter_display_list_exec(data, dl_off=dl_off))
+    seg_bases_init: Optional[Dict[int, int]] = None,
+) -> Tuple[List[Vtx], List[Tri], Dict[str, int], List[Optional[TexState]], List[UvInfo]]:
+    seg_bases: Dict[int, int] = dict(seg_bases_init or {})
+    cmds = list(_iter_display_list_exec(data, dl_off=dl_off, seg_bases=seg_bases))
     if not cmds:
         raise ValueError("No display-list commands found")
 
     all_verts: List[Vtx] = []
     all_tris: List[Tri] = []
     tri_states: List[Optional[TexState]] = []
+    tri_uv_info: List[UvInfo] = []
     vert_lut: Dict[Tuple[int, int, int, int, int, int, int, int, int], int] = {}
     vtx_loads = 0
     da_count = 0
     de_count = 0
     external_matrix_refs = 0
     external_dl_refs = 0
+    unresolved_setimg = 0
 
     cache: List[Optional[Vtx]] = [None] * 64
     current_mtx: List[List[float]] = _mtx_identity()
@@ -479,18 +636,67 @@ def parse_model_with_texstates(
     current_siz: Optional[int] = None
     current_pal_bank = 0
     current_wh: Tuple[int, int] = (32, 32)
+    base_uv_div: Tuple[int, int] = (4096, 4096)
+    current_uv_div: Tuple[int, int] = (4096, 4096)
+    current_uv_off: Tuple[int, int] = (0, 0)
+    current_tlut_entries: Optional[int] = None
+    last_tlut_candidate: Optional[int] = None
+    tile_fmt: List[Optional[int]] = [None] * 8
+    tile_siz: List[Optional[int]] = [None] * 8
+    tile_pal_bank: List[int] = [0] * 8
+    tile_tmem: List[int] = [0] * 8
+    tile_line: List[int] = [0] * 8
+    tile_wh: List[Optional[Tuple[int, int]]] = [None] * 8
+    tile_load_texels: List[Optional[int]] = [None] * 8
+    tile_load_siz: List[Optional[int]] = [None] * 8
+    tile_load_img: List[Optional[int]] = [None] * 8
+    tile_shift_s: List[int] = [0] * 8
+    tile_shift_t: List[int] = [0] * 8
+    active_render_tile = 0
+    texture_tile_locked = False
+
+    def _resolve_state_img() -> Optional[int]:
+        # Prefer TMEM-aware mapping from load tile image -> render tile sub-image.
+        # This is a lightweight approximation and not a full TMEM emulator.
+        render = int(active_render_tile)
+        render_tmem = int(tile_tmem[render]) if 0 <= render < 8 else 0
+        current = current_img
+
+        # Commonly, tile 7 is load tile and non-7 tile is render tile.
+        for load_tile in (7, render):
+            if not (0 <= load_tile < 8):
+                continue
+            base = tile_load_img[load_tile]
+            if base is None:
+                continue
+            load_tmem = int(tile_tmem[load_tile])
+            delta_words = render_tmem - load_tmem
+            if delta_words < 0:
+                continue
+            # TMEM address is in 64-bit words.
+            img = int(base) + (delta_words * 8)
+            if 0 <= img < len(data):
+                return img
+        return current
 
     def _make_state() -> Optional[TexState]:
-        if current_img is None or current_fmt is None or current_siz is None:
+        pal = current_pal
+        if pal is None and current_fmt == 2 and last_tlut_candidate is not None:
+            pal = last_tlut_candidate
+        state_img = _resolve_state_img()
+        if state_img is None or current_fmt is None or current_siz is None:
             return None
+        pal_bank = current_pal_bank
+        if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
+            pal_bank = 0
         return (
-            -1 if current_pal is None else int(current_pal),
-            int(current_img),
+            -1 if pal is None else int(pal),
+            int(state_img),
             int(current_wh[0]),
             int(current_wh[1]),
             int(current_fmt),
             int(current_siz),
-            int(current_pal_bank),
+            int(pal_bank),
         )
 
     for _, op, w0, w1 in cmds:
@@ -499,7 +705,7 @@ def parse_model_with_texstates(
             flags = w0 & 0xFF
             if (flags & 0x03) == 0x03:
                 continue
-            mtx_off = _resolve_segment_offset(data, w1)
+            mtx_off = _resolve_segment_offset(data, w1, seg_bases=seg_bases)
             if mtx_off is None:
                 external_matrix_refs += 1
                 continue
@@ -519,34 +725,112 @@ def parse_model_with_texstates(
 
         if op == 0xDE:  # G_DL
             de_count += 1
-            if _resolve_segment_offset(data, w1) is None:
+            if _resolve_segment_offset(data, w1, seg_bases=seg_bases) is None:
                 external_dl_refs += 1
             continue
 
         if op == 0xFD:  # G_SETTIMG
-            addr = _resolve_dl_addr(data, w1)
+            addr = _resolve_dl_addr(data, w1, seg_bases=seg_bases)
             if addr is None:
+                unresolved_setimg += 1
                 continue
             fmt = (w0 >> 21) & 0x7
             siz = (w0 >> 19) & 0x3
             if fmt == 0 and siz == 2 and (addr + 32) <= len(data):
-                current_pal = addr
-            else:
-                current_img = addr
+                last_tlut_candidate = addr
+            current_img = addr
+            continue
+
+        if op == 0xF0:  # G_LOADTLUT
+            if last_tlut_candidate is not None:
+                current_pal = last_tlut_candidate
+            tlut_entries = ((w1 >> 14) & 0x3FF) + 1
+            if tlut_entries > 0:
+                current_tlut_entries = int(tlut_entries)
             continue
 
         if op == 0xF5:  # G_SETTILE
             tile = (w1 >> 24) & 0x7
-            if tile != 7:
-                current_fmt = (w0 >> 21) & 0x7
-                current_siz = (w0 >> 19) & 0x3
-                current_pal_bank = (w1 >> 20) & 0xF
+            tile_fmt[tile] = (w0 >> 21) & 0x7
+            tile_siz[tile] = (w0 >> 19) & 0x3
+            tile_line[tile] = (w0 >> 9) & 0x1FF
+            tile_tmem[tile] = w0 & 0x1FF
+            tile_pal_bank[tile] = (w1 >> 20) & 0xF
+            tile_shift_t[tile] = (w1 >> 10) & 0xF
+            tile_shift_s[tile] = w1 & 0xF
+            if not texture_tile_locked and tile != 7:
+                active_render_tile = tile
+            if tile == active_render_tile:
+                current_fmt = tile_fmt[tile]
+                current_siz = tile_siz[tile]
+                current_pal_bank = tile_pal_bank[tile]
+                if tile_wh[tile] is not None:
+                    current_wh = tile_wh[tile]  # type: ignore[assignment]
+                elif tile_load_texels[tile] is not None:
+                    guessed_texels = _convert_loadblock_texels(
+                        int(tile_load_texels[tile]),
+                        tile_load_siz[tile],
+                        tile_siz[tile],
+                    )
+                    guess = _guess_wh_from_texels(guessed_texels)
+                    if guess is not None:
+                        tile_wh[tile] = guess
+                        current_wh = guess
+                current_uv_div = (
+                    _apply_shift_to_div(base_uv_div[0], tile_shift_s[tile]),
+                    _apply_shift_to_div(base_uv_div[1], tile_shift_t[tile]),
+                )
             continue
 
         if op == 0xF2:  # G_SETTILESIZE
-            wh = _decode_settilesize_wh(w1)
+            tile = (w0 >> 24) & 0x7
+            uls, ult, lrs, lrt = _decode_settilesize_range(w0, w1)
+            wh = _decode_settilesize_wh(w0, w1)
             if wh is not None:
-                current_wh = wh
+                tile_wh[tile] = wh
+            if tile == active_render_tile:
+                # Convert 10.2 texel offsets to 5-bit frac space (x8).
+                current_uv_off = (uls * 8, ult * 8)
+                if wh is not None:
+                    current_wh = wh
+                current_uv_div = (
+                    _apply_shift_to_div(base_uv_div[0], tile_shift_s[tile]),
+                    _apply_shift_to_div(base_uv_div[1], tile_shift_t[tile]),
+                )
+            continue
+
+        if op == 0xF3:  # G_LOADBLOCK
+            tile = (w1 >> 24) & 0x7
+            texels = ((w1 >> 12) & 0x0FFF) + 1
+            if texels > 0:
+                tile_load_texels[tile] = texels
+                tile_load_siz[tile] = tile_siz[tile]
+                tile_load_img[tile] = current_img
+                if tile == active_render_tile and tile_wh[tile] is None:
+                    guessed_texels = _convert_loadblock_texels(texels, tile_load_siz[tile], tile_siz[tile])
+                    guess = _guess_wh_from_texels(guessed_texels)
+                    if guess is not None:
+                        tile_wh[tile] = guess
+                        current_wh = guess
+            continue
+
+        if op == 0xD7:  # G_TEXTURE
+            s_scale = (w1 >> 16) & 0xFFFF
+            t_scale = w1 & 0xFFFF
+            active_render_tile = (w0 >> 8) & 0x7
+            texture_tile_locked = True
+            if tile_fmt[active_render_tile] is not None:
+                current_fmt = tile_fmt[active_render_tile]
+                current_siz = tile_siz[active_render_tile]
+                current_pal_bank = tile_pal_bank[active_render_tile]
+            base_uv_div = (_tex_scale_to_div(s_scale), _tex_scale_to_div(t_scale))
+            if tile_wh[active_render_tile] is not None:
+                tw, th = tile_wh[active_render_tile]  # type: ignore[misc]
+                current_wh = (tw, th)
+            current_uv_div = (
+                _apply_shift_to_div(base_uv_div[0], tile_shift_s[active_render_tile]),
+                _apply_shift_to_div(base_uv_div[1], tile_shift_t[active_render_tile]),
+            )
             continue
 
         if op == 0x01:  # VTX
@@ -555,7 +839,7 @@ def parse_model_with_texstates(
             v0 = end - n
             if n <= 0 or v0 < 0:
                 continue
-            voff = _resolve_segment_offset(data, w1)
+            voff = _resolve_segment_offset(data, w1, seg_bases=seg_bases)
             if voff is None:
                 continue
             block_verts = parse_vertices(data, voff, n)
@@ -594,6 +878,7 @@ def parse_model_with_texstates(
                 idxs.append(gi)
             all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
             tri_states.append(_make_state())
+            tri_uv_info.append((current_uv_div[0], current_uv_div[1], current_uv_off[0], current_uv_off[1]))
             continue
 
         if op == 0x06:  # TRI2
@@ -631,6 +916,44 @@ def parse_model_with_texstates(
                     idxs.append(gi)
                 all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
                 tri_states.append(_make_state())
+                tri_uv_info.append((current_uv_div[0], current_uv_div[1], current_uv_off[0], current_uv_off[1]))
+            continue
+
+        if op == 0x07:  # QUAD (best-effort: two triangles)
+            if tri_div2:
+                a = ((w0 >> 16) & 0xFF) // 2
+                b = ((w0 >> 8) & 0xFF) // 2
+                c = (w0 & 0xFF) // 2
+                d = ((w1 >> 16) & 0xFF) // 2
+            else:
+                a = (w0 >> 16) & 0xFF
+                b = (w0 >> 8) & 0xFF
+                c = w0 & 0xFF
+                d = (w1 >> 16) & 0xFF
+            for i0, i1, i2 in ((a, b, c), (a, c, d)):
+                if i0 >= len(cache) or i1 >= len(cache) or i2 >= len(cache):
+                    continue
+                va = cache[i0]
+                vb = cache[i1]
+                vc = cache[i2]
+                if va is None or vb is None or vc is None:
+                    continue
+                tv = [_apply_mtx(va, current_mtx), _apply_mtx(vb, current_mtx), _apply_mtx(vc, current_mtx)]
+                idxs: List[int] = []
+                for vv in tv:
+                    key = (vv.x, vv.y, vv.z, vv.s, vv.t, vv.r, vv.g, vv.b, vv.a)
+                    gi = vert_lut.get(key)
+                    if gi is None:
+                        gi = len(all_verts)
+                        all_verts.append(vv)
+                        vert_lut[key] = gi
+                    idxs.append(gi)
+                all_tris.append(Tri(idxs[0], idxs[1], idxs[2]))
+                tri_states.append(_make_state())
+                tri_uv_info.append((current_uv_div[0], current_uv_div[1], current_uv_off[0], current_uv_off[1]))
+            continue
+
+        if op == 0xBE:  # G_CULLDL (ignored)
             continue
 
     stats: Dict[str, int] = {
@@ -641,8 +964,9 @@ def parse_model_with_texstates(
         "de_count": de_count,
         "external_matrix_refs": external_matrix_refs,
         "external_dl_refs": external_dl_refs,
+        "unresolved_setimg": unresolved_setimg,
     }
-    return all_verts, all_tris, stats, tri_states
+    return all_verts, all_tris, stats, tri_states, tri_uv_info
 
 
 def _mesh_topology_penalty(verts: Sequence[Vtx], tris: Sequence[Tri]) -> float:
@@ -843,10 +1167,12 @@ def _prune_outlier_tris_with_states(
     verts: Sequence[Vtx],
     tris: Sequence[Tri],
     tri_states: Sequence[Optional[TexState]],
+    tri_uv_info: Optional[Sequence[UvInfo]] = None,
     mode: str = "full",
-) -> Tuple[List[Vtx], List[Tri], List[Optional[TexState]], int]:
+) -> Tuple[List[Vtx], List[Tri], List[Optional[TexState]], List[UvInfo], int]:
     if not verts or not tris:
-        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+        return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
     xs = [v.x for v in verts]
     ys = [v.y for v in verts]
     zs = [v.z for v in verts]
@@ -855,7 +1181,8 @@ def _prune_outlier_tris_with_states(
     ez = float(max(zs) - min(zs))
     diag = (ex * ex + ey * ey + ez * ez) ** 0.5
     if diag <= 0.0:
-        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+        return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
 
     max_edges: List[float] = []
     tri_areas: List[float] = []
@@ -891,16 +1218,19 @@ def _prune_outlier_tris_with_states(
         tri_metrics.append((ti, t, me, area, aspect))
 
     if not max_edges:
-        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+        return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
     if mode == "degenerate":
         keep_ids = [ti for (ti, _t, _me, area, aspect) in tri_metrics if area > 1e-4 and aspect < 1e6]
         removed = len(tris) - len(keep_ids)
         if removed <= 0:
-            return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+            uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+            return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
         kept_tris = [tris[i] for i in keep_ids]
         kept_states = [tri_states[i] if i < len(tri_states) else None for i in keep_ids]
+        kept_uvs = [tri_uv_info[i] for i in keep_ids] if tri_uv_info is not None else []
         out_verts, out_tris, out_states = _compact_mesh_with_states(verts, kept_tris, kept_states)
-        return out_verts, out_tris, out_states, removed
+        return out_verts, out_tris, out_states, kept_uvs, removed
 
     se = sorted(max_edges)
     sa = sorted(tri_areas)
@@ -915,14 +1245,17 @@ def _prune_outlier_tris_with_states(
     aspect_thresh = max(14.0, 1.4 * p95_s)
     keep_ids = [ti for (ti, _t, me, area, aspect) in tri_metrics if (me <= edge_thresh and area <= area_thresh and aspect <= aspect_thresh)]
     if len(keep_ids) < max(1, len(tris) // 3):
-        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+        return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
     removed = len(tris) - len(keep_ids)
     if removed <= 0:
-        return list(verts), list(tris), list(tri_states[: len(tris)]), 0
+        uv = list(tri_uv_info[: len(tris)]) if tri_uv_info is not None else []
+        return list(verts), list(tris), list(tri_states[: len(tris)]), uv, 0
     kept_tris = [tris[i] for i in keep_ids]
     kept_states = [tri_states[i] if i < len(tri_states) else None for i in keep_ids]
+    kept_uvs = [tri_uv_info[i] for i in keep_ids] if tri_uv_info is not None else []
     out_verts, out_tris, out_states = _compact_mesh_with_states(verts, kept_tris, kept_states)
-    return out_verts, out_tris, out_states, removed
+    return out_verts, out_tris, out_states, kept_uvs, removed
 
 
 def rgba5551_to_rgba8888(v: int) -> Tuple[int, int, int, int]:
@@ -976,17 +1309,42 @@ def _extract_ci4_texture_at(data: bytes, pal_off: int, img_off: int, width: int 
     return pixels, width, height
 
 
-def _decode_settilesize_wh(w1: int) -> Optional[Tuple[int, int]]:
-    # F2 (G_SETTILESIZE): w1 packs lrs/lrt in 10.2 fixed-ish fields.
+def _decode_settilesize_wh(w0: int, w1: int) -> Optional[Tuple[int, int]]:
+    # F2 (G_SETTILESIZE): w0 packs uls/ult, w1 packs lrs/lrt in 10.2 fields.
+    uls = (w0 >> 12) & 0x0FFF
+    ult = w0 & 0x0FFF
     lrs = (w1 >> 12) & 0x0FFF
     lrt = w1 & 0x0FFF
-    width = (lrs >> 2) + 1
-    height = (lrt >> 2) + 1
+    width = ((lrs - uls) >> 2) + 1
+    height = ((lrt - ult) >> 2) + 1
     if width <= 0 or height <= 0:
         return None
-    if width > 512 or height > 512:
+    if width > 1024 or height > 1024:
         return None
     return width, height
+
+
+def _decode_settilesize_range(w0: int, w1: int) -> Tuple[int, int, int, int]:
+    uls = (w0 >> 12) & 0x0FFF
+    ult = w0 & 0x0FFF
+    lrs = (w1 >> 12) & 0x0FFF
+    lrt = w1 & 0x0FFF
+    return uls, ult, lrs, lrt
+
+
+def _guess_wh_from_texels(texels: int) -> Optional[Tuple[int, int]]:
+    if texels <= 0:
+        return None
+    root = int(round(math.sqrt(texels)))
+    if root > 0 and root * root == texels:
+        if root <= 1024:
+            return root, root
+    for w in (8, 16, 32, 64, 128, 256, 512, 1024):
+        if texels % w == 0:
+            h = texels // w
+            if 1 <= h <= 1024:
+                return w, h
+    return None
 
 
 def _decode_rgba16_pixels(data: bytes, img_off: int, width: int, height: int) -> List[Tuple[int, int, int, int]]:
@@ -1130,6 +1488,72 @@ def _decode_texture_pixels(
     raise ValueError("unsupported texture format")
 
 
+def _decode_texture_pixels_best_palbank(
+    data: bytes,
+    fmt: int,
+    siz: int,
+    img_off: int,
+    width: int,
+    height: int,
+    pal_off: Optional[int] = None,
+    pal_bank: int = 0,
+) -> List[Tuple[int, int, int, int]]:
+    def _decode_pick_score(px: Sequence[Tuple[int, int, int, int]]) -> float:
+        s = _texture_visual_score(px, width, height)
+        n = max(1, len(px))
+        a0_ratio = sum(1 for p in px if p[3] == 0) / n
+        # Strongly discourage heavily transparent decodes. These are often
+        # false CI/TLUT interpretations that look colorful but map badly.
+        if a0_ratio >= 0.98:
+            s += 1.6
+        elif a0_ratio >= 0.90:
+            s += 1.25
+        elif a0_ratio >= 0.80:
+            s += 0.9
+        elif a0_ratio >= 0.65:
+            s += 0.55
+        return s
+
+    base_pixels = _decode_texture_pixels(data, fmt, siz, img_off, width, height, pal_off, pal_bank=pal_bank)
+    base_score = _decode_pick_score(base_pixels)
+
+    # For CI4, first resolve palette-bank ambiguity.
+    if fmt == 2 and siz == 0 and pal_off is not None:
+        best: Tuple[float, List[Tuple[int, int, int, int]]] = (base_score, base_pixels)
+        tried = {int(pal_bank)}
+        for bank in (0, int(pal_bank), 1, 2, 3, 4, 5, 6, 7):
+            if bank in tried:
+                continue
+            tried.add(bank)
+            try:
+                pixels = _decode_texture_pixels(data, fmt, siz, img_off, width, height, pal_off, pal_bank=bank)
+            except Exception:
+                continue
+            score = _decode_pick_score(pixels)
+            if score < best[0]:
+                best = (score, pixels)
+        base_score, base_pixels = best
+
+    # CI4 state can be mislabeled in some streams; compare against I/IA variants.
+    # Keep CI4 unless an alternate decode is clearly better.
+    if fmt == 2 and siz == 0:
+        alt_best: Optional[Tuple[float, List[Tuple[int, int, int, int]]]] = None
+        for alt_fmt, alt_siz in ((4, 1), (3, 1), (4, 0), (3, 0)):
+            try:
+                alt_pixels = _decode_texture_pixels(
+                    data, alt_fmt, alt_siz, img_off, width, height, pal_off=None, pal_bank=0
+                )
+            except Exception:
+                continue
+            alt_score = _decode_pick_score(alt_pixels)
+            if alt_best is None or alt_score < alt_best[0]:
+                alt_best = (alt_score, alt_pixels)
+        if alt_best is not None and alt_best[0] + 0.10 < base_score:
+            return alt_best[1]
+
+    return base_pixels
+
+
 def _texture_state_pref_score(fmt: int, siz: int) -> int:
     # Prefer paletted/colored states first for single-texture OBJ export.
     if fmt == 2 and siz == 0:  # CI4
@@ -1149,7 +1573,8 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
     # Heuristic decode from RDP command stream:
     # - FD100000 commonly points to RGBA16 TLUT (16 entries)
     # - FD500000 / FD900000 commonly point to CI4 image payloads
-    cmds = list(_iter_display_list_exec(data, dl_off=dl_off))
+    seg_bases: Dict[int, int] = {}
+    cmds = list(_iter_display_list_exec(data, dl_off=dl_off, seg_bases=seg_bases))
     pal_offs: List[int] = []
     img_offs: List[int] = []
     current_pal: Optional[int] = None
@@ -1158,40 +1583,82 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
     current_fmt: Optional[int] = None
     current_siz: Optional[int] = None
     current_pal_bank: int = 0
+    current_tlut_entries: Optional[int] = None
+    last_tlut_candidate: Optional[int] = None
+    tile_fmt: List[Optional[int]] = [None] * 8
+    tile_siz: List[Optional[int]] = [None] * 8
+    tile_pal_bank: List[int] = [0] * 8
+    tile_wh: List[Optional[Tuple[int, int]]] = [None] * 8
+    tile_load_texels: List[Optional[int]] = [None] * 8
+    active_render_tile = 0
     usage: Dict[Tuple[int, int, int, int, int, int, int], int] = {}
 
     for _off, op, w0, w1 in cmds:
         if op == 0xFD:
-            addr = _resolve_dl_addr(data, w1)
+            addr = _resolve_dl_addr(data, w1, seg_bases=seg_bases)
             if addr is None:
                 continue
             fmt = (w0 >> 21) & 0x7
             siz = (w0 >> 19) & 0x3
             if fmt == 0 and siz == 2 and (addr + 32) <= len(data):
                 pal_offs.append(addr)
-                current_pal = addr
-            else:
-                img_offs.append(addr)
-                current_img = addr
+                last_tlut_candidate = addr
+            img_offs.append(addr)
+            current_img = addr
+            continue
+
+        if op == 0xF0:  # G_LOADTLUT
+            if last_tlut_candidate is not None:
+                current_pal = last_tlut_candidate
+            tlut_entries = ((w1 >> 14) & 0x3FF) + 1
+            if tlut_entries > 0:
+                current_tlut_entries = int(tlut_entries)
             continue
 
         if op == 0xF5:
             # Track render-tile fmt/siz/palette bank. Tile 7 is often load tile.
             tile = (w1 >> 24) & 0x7
+            tile_fmt[tile] = (w0 >> 21) & 0x7
+            tile_siz[tile] = (w0 >> 19) & 0x3
+            tile_pal_bank[tile] = (w1 >> 20) & 0xF
             if tile != 7:
-                current_fmt = (w0 >> 21) & 0x7
-                current_siz = (w0 >> 19) & 0x3
-                current_pal_bank = (w1 >> 20) & 0xF
+                active_render_tile = tile
+                current_fmt = tile_fmt[tile]
+                current_siz = tile_siz[tile]
+                current_pal_bank = tile_pal_bank[tile]
+                if tile_wh[tile] is not None:
+                    current_wh = tile_wh[tile]
             continue
 
         if op == 0xF2:
-            wh = _decode_settilesize_wh(w1)
+            tile = (w0 >> 24) & 0x7
+            wh = _decode_settilesize_wh(w0, w1)
             if wh is not None:
-                current_wh = wh
+                tile_wh[tile] = wh
+                if tile == active_render_tile:
+                    current_wh = wh
+            continue
+
+        if op == 0xF3:  # G_LOADBLOCK
+            tile = (w1 >> 24) & 0x7
+            texels = ((w1 >> 12) & 0x0FFF) + 1
+            if texels > 0:
+                tile_load_texels[tile] = texels
+                if tile == active_render_tile and tile_wh[tile] is None:
+                    guess = _guess_wh_from_texels(texels)
+                    if guess is not None:
+                        tile_wh[tile] = guess
+                        current_wh = guess
             continue
 
         if op in (0x05, 0x06):
-            if current_pal is None or current_img is None:
+            pal = current_pal
+            if pal is None and current_fmt == 2 and last_tlut_candidate is not None:
+                pal = last_tlut_candidate
+            pal_bank = current_pal_bank
+            if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
+                pal_bank = 0
+            if pal is None or current_img is None:
                 # Non-CI formats may not require a palette.
                 if current_img is None:
                     continue
@@ -1202,13 +1669,13 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
                 continue
             tri_inc = 2 if op == 0x06 else 1
             key = (
-                -1 if current_pal is None else current_pal,
+                -1 if pal is None else pal,
                 current_img,
                 width,
                 height,
                 current_fmt,
                 current_siz,
-                current_pal_bank,
+                pal_bank,
             )
             usage[key] = usage.get(key, 0) + tri_inc
 
@@ -1239,12 +1706,13 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
         for width, height in candidate_dims:
             candidates.append((0, pal, img, width, height, 2, 0, 0))
 
+    best: Optional[Tuple[float, List[Tuple[int, int, int, int]], int, int]] = None
     # Try best-ranked pair first, then alternate dimensions if needed.
     for _hits, pal, img, width, height, fmt, siz, pal_bank in candidates:
         trial_dims = [(width, height)] + [d for d in candidate_dims if d != (width, height)]
         for tw, th in trial_dims:
             try:
-                pixels = _decode_texture_pixels(
+                pixels = _decode_texture_pixels_best_palbank(
                     data=data,
                     fmt=fmt,
                     siz=siz,
@@ -1254,45 +1722,43 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
                     pal_off=None if pal < 0 else pal,
                     pal_bank=pal_bank,
                 )
-                return pixels, tw, th
+                score = _texture_visual_score(pixels, tw, th)
+                # Slightly favor states with more triangle hits.
+                score -= min(0.5, (_hits * 0.02))
+                if best is None or score < best[0]:
+                    best = (score, pixels, tw, th)
             except Exception:
                 continue
 
-    raise ValueError("failed to decode texture from inferred DL state")
+    if best is None:
+        raise ValueError("failed to decode texture from inferred DL state")
+    return best[1], best[2], best[3]
 
 
 def _build_materials_from_tri_states(
     data: bytes,
     out_base: pathlib.Path,
     tri_states: Sequence[Optional[TexState]],
+    tri_uv_areas: Optional[Sequence[float]] = None,
 ) -> Tuple[Optional[List[str]], Optional[Dict[str, str]], int]:
     if Image is None:
         return None, None, 0
     usage: Dict[TexState, int] = {}
-    for st in tri_states:
+    area_usage: Dict[TexState, float] = {}
+    for i, st in enumerate(tri_states):
         if st is None:
             continue
         usage[st] = usage.get(st, 0) + 1
+        if tri_uv_areas is not None and i < len(tri_uv_areas):
+            area_usage[st] = area_usage.get(st, 0.0) + float(tri_uv_areas[i])
     if not usage:
         return None, None, 0
 
-    ordered = sorted(
-        usage.items(),
-        key=lambda kv: (
-            int(kv[1]),
-            _texture_state_pref_score(int(kv[0][4]), int(kv[0][5])),
-            -int(kv[0][6]),
-            -int(kv[0][2] * kv[0][3]),
-        ),
-        reverse=True,
-    )
-
-    mat_tex: Dict[str, str] = {}
-    state_to_mat: Dict[TexState, str] = {}
-    for i, (st, _hits) in enumerate(ordered):
+    decoded: List[Tuple[TexState, int, float, float, int, int, List[Tuple[int, int, int, int]]]] = []
+    for st, hits in usage.items():
         pal, img, w, h, fmt, siz, pal_bank = st
         try:
-            pixels = _decode_texture_pixels(
+            pixels = _decode_texture_pixels_best_palbank(
                 data=data,
                 fmt=fmt,
                 siz=siz,
@@ -1304,11 +1770,32 @@ def _build_materials_from_tri_states(
             )
         except Exception:
             continue
-        mat_name = f"mat{i:02d}"
+        vis_score = _texture_visual_score(pixels, w, h)
+        area = area_usage.get(st, 0.0)
+        decoded.append((st, hits, vis_score, area, w, h, pixels))
+
+    if not decoded:
+        return None, None, 0
+
+    area_norm = max(1e-6, sum(kv[3] for kv in decoded))
+    ordered = sorted(
+        decoded,
+        key=lambda kv: (
+            float(kv[1]) + (kv[3] / area_norm) * 3.0,  # tri hits + uv area coverage
+            -float(kv[2]),  # lower visual score is better
+            _texture_state_pref_score(int(kv[0][4]), int(kv[0][5])),
+            -int(kv[0][6]),
+            int(kv[4] * kv[5]),
+        ),
+        reverse=True,
+    )
+
+    mat_tex: Dict[str, str] = {}
+    state_to_mat: Dict[TexState, str] = {}
+    for i, (st, _hits, _vis, _area, w, h, pixels) in enumerate(ordered):
+        mat_name = f"{out_base.stem}_mat{i:02d}"
         tex_name = f"{out_base.stem}_tex{i:02d}.png"
-        img_out = Image.new("RGBA", (w, h))
-        img_out.putdata(pixels)
-        img_out.save(out_base.with_name(f"{out_base.stem}_tex{i:02d}.png"))
+        _save_texture_png(out_base.with_name(f"{out_base.stem}_tex{i:02d}.png"), pixels, w, h)
         mat_tex[mat_name] = tex_name
         state_to_mat[st] = mat_name
 
@@ -1319,6 +1806,449 @@ def _build_materials_from_tri_states(
     return tri_mats, mat_tex, len(mat_tex)
 
 
+def _best_texture_from_tri_states(
+    data: bytes,
+    tri_states: Sequence[Optional[TexState]],
+    tri_uv_areas: Optional[Sequence[float]] = None,
+) -> Optional[Tuple[List[Tuple[int, int, int, int]], int, int]]:
+    usage: Dict[TexState, int] = {}
+    area_usage: Dict[TexState, float] = {}
+    for i, st in enumerate(tri_states):
+        if st is None:
+            continue
+        usage[st] = usage.get(st, 0) + 1
+        if tri_uv_areas is not None and i < len(tri_uv_areas):
+            area_usage[st] = area_usage.get(st, 0.0) + float(tri_uv_areas[i])
+    if not usage:
+        return None
+
+    best: Optional[Tuple[float, List[Tuple[int, int, int, int]], int, int]] = None
+    area_norm = max(1e-6, sum(area_usage.values()))
+    for st, hits in usage.items():
+        pal, img, w, h, fmt, siz, pal_bank = st
+        try:
+            pixels = _decode_texture_pixels_best_palbank(
+                data=data,
+                fmt=fmt,
+                siz=siz,
+                img_off=img,
+                width=w,
+                height=h,
+                pal_off=None if pal < 0 else pal,
+                pal_bank=pal_bank,
+            )
+        except Exception:
+            continue
+        vis_score = _texture_visual_score(pixels, w, h)
+        area = area_usage.get(st, 0.0)
+        score = vis_score - (hits * 0.02) - ((area / area_norm) * 0.5)
+        if best is None or score < best[0]:
+            best = (score, pixels, w, h)
+
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
+
+
+def _apply_known_texture_fixes(
+    yay0_offset: Optional[int],
+    rom_off: int,
+    verts: Sequence[Vtx],
+    tris: Sequence[Tri],
+    tri_states: Sequence[Optional[TexState]],
+    tri_mats: List[str],
+    tri_uv_info: List[UvInfo],
+) -> int:
+    # Model-specific fix: y0515_00B22068_m00_000010 has right-side texstates that
+    # should mirror/reuse the left-side image family.
+    if yay0_offset is None or int(yay0_offset) != 0x00B22068 or int(rom_off) != 0x10:
+        return 0
+    if not tri_mats or not tri_states or not tris or not tri_uv_info:
+        return 0
+
+    state_to_mat: Dict[TexState, str] = {}
+    for i, st in enumerate(tri_states):
+        if st is None or i >= len(tri_mats):
+            continue
+        if st not in state_to_mat:
+            state_to_mat[st] = tri_mats[i]
+
+    mat_remap: Dict[str, str] = {}
+    for st, mat in state_to_mat.items():
+        pal, img, w, h, fmt, siz, pal_bank = st
+        if int(img) != 0x1210:
+            continue
+        target = (int(pal), 0x1410, int(w), int(h), int(fmt), int(siz), int(pal_bank))
+        mat2 = state_to_mat.get(target)
+        if mat2 and mat2 != mat:
+            mat_remap[mat] = mat2
+
+    if not mat_remap:
+        return 0
+
+    fixed = 0
+    for i, t in enumerate(tris):
+        if i >= len(tri_mats) or i >= len(tri_uv_info):
+            continue
+        src_mat = tri_mats[i]
+        dst_mat = mat_remap.get(src_mat)
+        if not dst_mat:
+            continue
+        cx = (verts[t.i0].x + verts[t.i1].x + verts[t.i2].x) / 3.0
+        if cx <= 0.0:
+            continue
+        tri_mats[i] = dst_mat
+        du, dv, ou, ov = tri_uv_info[i]
+        # Mirror U by replacing u with (1 - u):
+        # u=(s-ou)/du -> u'=(s-(ou+du))/(-du)=1-u
+        if du != 0:
+            tri_uv_info[i] = (-int(du), int(dv), int(ou + du), int(ov))
+        fixed += 1
+    return fixed
+
+
+def _texture_visual_score(pixels: Sequence[Tuple[int, int, int, int]], w: int, h: int) -> float:
+    # Lower score is better. Rejects flat/noisy garbage heuristically.
+    n = len(pixels)
+    if n <= 0 or w <= 0 or h <= 0:
+        return 1e9
+    uniq = len(set(pixels))
+    uniq_ratio = uniq / max(1, n)
+    if uniq <= 1:
+        return 1e9
+
+    def lum(px: Tuple[int, int, int, int]) -> float:
+        return (0.2126 * px[0]) + (0.7152 * px[1]) + (0.0722 * px[2])
+
+    vals = [lum(p) for p in pixels]
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / n
+    std = var ** 0.5
+
+    # Edge activity on luma: too low=flat; too high=random noise.
+    edge_sum = 0.0
+    edge_cnt = 0
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            if x + 1 < w:
+                edge_sum += abs(vals[i] - vals[i + 1])
+                edge_cnt += 1
+            if y + 1 < h:
+                edge_sum += abs(vals[i] - vals[i + w])
+                edge_cnt += 1
+    edge = (edge_sum / max(1, edge_cnt))
+    l8 = [max(0, min(255, int(round(v)))) for v in vals]
+
+    parity_even = 0
+    parity_odd = 0
+    ce = 0
+    co = 0
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            v = l8[row + x]
+            if ((x + y) & 1) == 0:
+                parity_even += v
+                ce += 1
+            else:
+                parity_odd += v
+                co += 1
+    pmean_e = (parity_even / ce) if ce else 0.0
+    pmean_o = (parity_odd / co) if co else 0.0
+    parity_bias = abs(pmean_e - pmean_o) / 255.0
+    seam = _grid_seam_penalty(l8, w, h, periods=[4, 8, 16, 32])
+    interlace = _row_interlace_penalty(l8, w, h, 255.0)
+
+    # Moderate complexity and moderate edge energy tend to be useful textures.
+    score = 0.0
+    score += abs(edge - 24.0) / 24.0
+    score += abs(std - 48.0) / 48.0
+    score += 0.6 * abs(uniq_ratio - 0.18) / 0.18
+    score += 0.8 * parity_bias
+    score += 0.8 * interlace
+    score += 0.5 * seam
+    # Penalize mostly/fully transparent outputs; these are often bad TLUT picks.
+    alpha0_ratio = sum(1 for p in pixels if p[3] == 0) / max(1, n)
+    if alpha0_ratio >= 0.98:
+        score += 1.25
+    elif alpha0_ratio >= 0.90:
+        score += 0.35
+    return score
+
+
+def _sanitize_texture_alpha(pixels: Sequence[Tuple[int, int, int, int]]) -> List[Tuple[int, int, int, int]]:
+    out = list(pixels)
+    if not out:
+        return out
+    # If every alpha channel is zero but RGB carries data, treat as opaque for usability.
+    if all(px[3] == 0 for px in out) and any((px[0] | px[1] | px[2]) != 0 for px in out):
+        return [(px[0], px[1], px[2], 255) for px in out]
+    return out
+
+
+def _save_texture_png(out_path: pathlib.Path, pixels: Sequence[Tuple[int, int, int, int]], w: int, h: int) -> None:
+    if Image is None:
+        raise RuntimeError("Pillow is required for PNG export: pip install pillow")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    px = _sanitize_texture_alpha(pixels)
+    img = Image.new("RGBA", (w, h))
+    img.putdata(px)
+    img.save(out_path)
+
+
+def _collect_unresolved_setimg_seg_offsets(data: bytes, dl_off: int = 8, seg_id: int = 0x04) -> List[int]:
+    seg_bases: Dict[int, int] = {}
+    offs: List[int] = []
+    for _off, op, w0, w1 in _iter_display_list_exec(data, dl_off=dl_off, seg_bases=seg_bases):
+        if op != 0xFD:
+            continue
+        seg = (w1 >> 24) & 0xFF
+        if seg != seg_id:
+            continue
+        addr = _resolve_dl_addr(data, w1, seg_bases=seg_bases)
+        if addr is None:
+            offs.append(w1 & 0x00FFFFFF)
+    return sorted(set(offs))
+
+
+def _seg4_bridge_candidates(
+    local_blob: bytes,
+    full_rom: bytes,
+    yay0_off: int,
+    dl_off: int,
+) -> List[Tuple[bytes, Dict[int, int], int]]:
+    # Build local+external composite candidates for unresolved seg4 image pointers.
+    offs = _collect_unresolved_setimg_seg_offsets(local_blob, dl_off=dl_off, seg_id=0x04)
+    if not offs:
+        return []
+
+    min_off = int(min(offs))
+    max_off = int(max(offs))
+    if min_off < 0 or max_off < min_off:
+        return local_blob, None
+
+    # Candidate bases near this Yay0 region.
+    hi = int(yay0_off) & 0x00FF0000
+    est = (int(yay0_off) - min_off) & 0x00FFFF0000
+    cand_bases = []
+    for b in (est, hi - 0x20000, hi - 0x10000, hi, hi + 0x10000):
+        if b not in cand_bases:
+            cand_bases.append(b)
+
+    span = max(0x2000, (max_off - min_off) + 0x800)
+    out: List[Tuple[bytes, Dict[int, int], int]] = []
+    for b in cand_bases:
+        ext_start = int(b) + min_off
+        ext_end = ext_start + span
+        if ext_start < 0 or ext_end > len(full_rom):
+            continue
+        ext = full_rom[ext_start:ext_end]
+        if not ext:
+            continue
+        append_at = len(local_blob)
+        composite = local_blob + ext
+        seg4_local_base = append_at - min_off
+        out.append((composite, {0x04: int(seg4_local_base)}, int(b)))
+    return out
+
+
+def _extract_textures_from_model_chunk(
+    data: bytes,
+    chunk_label: str,
+    out_dir: pathlib.Path,
+    min_tri_hits: int = 2,
+) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for mi, moff in enumerate(iter_model_headers(data)):
+        dl_off = moff + 8
+        for tri_div2 in (True, False):
+            try:
+                _v, _t, _s, tri_states, _uv = parse_model_with_texstates(data, dl_off=dl_off, tri_div2=tri_div2)
+            except Exception:
+                continue
+            usage: Dict[TexState, int] = {}
+            for st in tri_states:
+                if st is None:
+                    continue
+                usage[st] = usage.get(st, 0) + 1
+            if not usage:
+                continue
+            ordered = sorted(
+                usage.items(),
+                key=lambda kv: (
+                    int(kv[1]),
+                    _texture_state_pref_score(int(kv[0][4]), int(kv[0][5])),
+                    -int(kv[0][6]),
+                    -int(kv[0][2] * kv[0][3]),
+                ),
+                reverse=True,
+            )
+            for si, (st, hits) in enumerate(ordered):
+                if hits < min_tri_hits:
+                    continue
+                pal, img, w, h, fmt, siz, pal_bank = st
+                try:
+                    pixels = _decode_texture_pixels_best_palbank(
+                        data=data,
+                        fmt=fmt,
+                        siz=siz,
+                        img_off=img,
+                        width=w,
+                        height=h,
+                        pal_off=None if pal < 0 else pal,
+                        pal_bank=pal_bank,
+                    )
+                except Exception:
+                    continue
+                score = _texture_visual_score(pixels, w, h)
+                tex_name = (
+                    f"{chunk_label}_m{mi:03d}_o{moff:06X}_"
+                    f"s{si:02d}_f{fmt}z{siz}_p{pal_bank}_i{img:06X}_{w}x{h}.png"
+                )
+                out_path = out_dir / tex_name
+                _save_texture_png(out_path, pixels, w, h)
+                out.append(
+                    {
+                        "source": "model_dl",
+                        "chunk": chunk_label,
+                        "model_offset": moff,
+                        "tri_div2": bool(tri_div2),
+                        "tri_hits": int(hits),
+                        "texture_state": {
+                            "pal": pal,
+                            "img": img,
+                            "w": w,
+                            "h": h,
+                            "fmt": fmt,
+                            "siz": siz,
+                            "pal_bank": pal_bank,
+                        },
+                        "score": float(score),
+                        "png": str(out_path),
+                    }
+                )
+    return out
+
+
+def _tri_state_decode_score(data: bytes, tri_states: Sequence[Optional[TexState]]) -> float:
+    usage: Dict[TexState, int] = {}
+    for st in tri_states:
+        if st is None:
+            continue
+        usage[st] = usage.get(st, 0) + 1
+    if not usage:
+        return 1e9
+    total = 0.0
+    hits_total = 0
+    for st, hits in usage.items():
+        pal, img, w, h, fmt, siz, pal_bank = st
+        try:
+            pixels = _decode_texture_pixels_best_palbank(
+                data=data,
+                fmt=fmt,
+                siz=siz,
+                img_off=img,
+                width=w,
+                height=h,
+                pal_off=None if pal < 0 else pal,
+                pal_bank=pal_bank,
+            )
+            s = _texture_visual_score(pixels, w, h)
+        except Exception:
+            s = 5.0
+        total += float(s) * float(hits)
+        hits_total += int(hits)
+    return total / max(1, hits_total)
+
+
+def _candidate_pal16_offsets(data: bytes, step: int = 0x20) -> List[int]:
+    offs: List[int] = []
+    for o in range(0, max(0, len(data) - 32), max(2, step)):
+        try:
+            cols = []
+            for i in range(16):
+                v = (data[o + i * 2] << 8) | data[o + i * 2 + 1]
+                cols.append(rgba5551_to_rgba8888(v))
+            uniq = len(set(cols))
+            if uniq >= 6:
+                offs.append(o)
+        except Exception:
+            continue
+    return offs
+
+
+def _extract_generic_texture_candidates(
+    data: bytes,
+    chunk_label: str,
+    out_dir: pathlib.Path,
+    top_per_chunk: int = 10,
+) -> List[Dict[str, object]]:
+    dims = [(16, 16), (32, 32), (64, 64), (64, 32), (32, 64), (128, 128)]
+    cand: List[Tuple[float, Dict[str, object], List[Tuple[int, int, int, int]], int, int, pathlib.Path]] = []
+    pals = _candidate_pal16_offsets(data, step=0x20)
+
+    # Heuristic CI4 sprite layouts: TLUT followed by image payload.
+    for pal in pals[:512]:
+        img = pal + 32
+        for w, h in dims:
+            need = (w * h + 1) // 2
+            if img + need > len(data):
+                continue
+            try:
+                pixels = _decode_ci_pixels(data, pal, img, w, h, siz=0, pal_bank=0)
+            except Exception:
+                continue
+            s = _texture_visual_score(pixels, w, h)
+            if s > 2.1:
+                continue
+            meta = {
+                "source": "generic_ci4",
+                "chunk": chunk_label,
+                "texture_state": {"pal": pal, "img": img, "w": w, "h": h, "fmt": 2, "siz": 0, "pal_bank": 0},
+                "score": float(s),
+            }
+            name = f"{chunk_label}_g_ci4_p{pal:06X}_i{img:06X}_{w}x{h}.png"
+            cand.append((s, meta, pixels, w, h, out_dir / name))
+
+    # Raw non-paletted candidates at common sprite sizes.
+    for img in range(0, max(0, len(data) - 64), 0x40):
+        for fmt, siz in ((4, 1), (4, 0), (3, 1), (3, 0), (0, 2)):
+            for w, h in ((16, 16), (32, 32), (64, 32), (32, 64)):
+                try:
+                    pixels = _decode_texture_pixels(data, fmt, siz, img, w, h, pal_off=None, pal_bank=0)
+                except Exception:
+                    continue
+                s = _texture_visual_score(pixels, w, h)
+                if s > 1.8:
+                    continue
+                meta = {
+                    "source": "generic_raw",
+                    "chunk": chunk_label,
+                    "texture_state": {"pal": -1, "img": img, "w": w, "h": h, "fmt": fmt, "siz": siz, "pal_bank": 0},
+                    "score": float(s),
+                }
+                name = f"{chunk_label}_g_f{fmt}z{siz}_i{img:06X}_{w}x{h}.png"
+                cand.append((s, meta, pixels, w, h, out_dir / name))
+
+    cand.sort(key=lambda x: float(x[0]))
+    out: List[Dict[str, object]] = []
+    seen_keys: set[str] = set()
+    for s, meta, pixels, w, h, path in cand:
+        key = f"{meta['source']}:{meta['texture_state']['img']}:{meta['texture_state']['fmt']}:{meta['texture_state']['siz']}:{w}x{h}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        _save_texture_png(path, pixels, w, h)
+        m = dict(meta)
+        m["png"] = str(path)
+        out.append(m)
+        if len(out) >= top_per_chunk:
+            break
+    return out
+
+
 def write_obj_mtl(
     out_base: pathlib.Path,
     verts: Sequence[Vtx],
@@ -1326,37 +2256,77 @@ def write_obj_mtl(
     with_texture: bool,
     tri_materials: Optional[Sequence[str]] = None,
     material_textures: Optional[Dict[str, str]] = None,
+    tri_uv_info: Optional[Sequence[UvInfo]] = None,
 ) -> None:
     obj_path = out_base.with_suffix(".obj")
     mtl_path = out_base.with_suffix(".mtl")
     tex_name = out_base.with_suffix(".png").name
+    default_mat_name = f"{out_base.stem}_mat0"
 
     with obj_path.open("w", encoding="utf-8", newline="\n") as f:
         if with_texture:
             f.write(f"mtllib {mtl_path.name}\n")
             if not tri_materials:
-                f.write("usemtl mat0\n")
+                f.write(f"usemtl {default_mat_name}\n")
         for v in verts:
             f.write(f"v {v.x} {v.y} {v.z}\n")
-        # UV scaling observed in sample: 10.2 fixed-ish style with 4096 tile range.
-        for v in verts:
-            u = v.s / 4096.0
-            vv = 1.0 - (v.t / 4096.0)
-            f.write(f"vt {u:.6f} {vv:.6f}\n")
-        current_mtl: Optional[str] = None
-        for ti, t in enumerate(tris):
-            if with_texture and tri_materials and ti < len(tri_materials):
-                mtl = tri_materials[ti]
-                if mtl != current_mtl:
-                    f.write(f"usemtl {mtl}\n")
-                    current_mtl = mtl
-            # OBJ is 1-based.
-            a = t.i0 + 1
-            b = t.i1 + 1
-            c = t.i2 + 1
-            f.write(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+        vt_lines: List[str] = []
+        face_lines: List[str] = []
+        if tri_uv_info:
+            vt_index = 1
+            current_mtl = None
+            for ti, t in enumerate(tris):
+                if with_texture and tri_materials and ti < len(tri_materials):
+                    mtl = tri_materials[ti]
+                    if mtl != current_mtl:
+                        face_lines.append(f"usemtl {mtl}\n")
+                        current_mtl = mtl
+                info = tri_uv_info[ti] if ti < len(tri_uv_info) else (4096, 4096, 0, 0)
+                idxs: List[int] = []
+                for vi in (t.i0, t.i1, t.i2):
+                    v = verts[vi]
+                    u = (v.s - info[2]) / float(info[0])
+                    vv = 1.0 - ((v.t - info[3]) / float(info[1]))
+                    vt_lines.append(f"vt {u:.6f} {vv:.6f}\n")
+                    idxs.append(vt_index)
+                    vt_index += 1
+                a = t.i0 + 1
+                b = t.i1 + 1
+                c = t.i2 + 1
+                face_lines.append(f"f {a}/{idxs[0]} {b}/{idxs[1]} {c}/{idxs[2]}\n")
+        else:
+            # UV scaling observed in sample: 10.2 fixed-ish style with 4096 tile range.
+            for v in verts:
+                u = v.s / 4096.0
+                vv = 1.0 - (v.t / 4096.0)
+                vt_lines.append(f"vt {u:.6f} {vv:.6f}\n")
+            current_mtl = None
+            for ti, t in enumerate(tris):
+                if with_texture and tri_materials and ti < len(tri_materials):
+                    mtl = tri_materials[ti]
+                    if mtl != current_mtl:
+                        face_lines.append(f"usemtl {mtl}\n")
+                        current_mtl = mtl
+                a = t.i0 + 1
+                b = t.i1 + 1
+                c = t.i2 + 1
+                face_lines.append(f"f {a}/{a} {b}/{b} {c}/{c}\n")
+        for line in vt_lines:
+            f.write(line)
+        for line in face_lines:
+            f.write(line)
 
     if with_texture:
+        def _png_has_alpha(path: pathlib.Path) -> bool:
+            if Image is None or (not path.exists()):
+                return False
+            try:
+                im = Image.open(path).convert("RGBA")
+                mn, mx = im.getchannel("A").getextrema()
+                return mn < 255
+            except Exception:
+                return False
+
         with mtl_path.open("w", encoding="utf-8", newline="\n") as f:
             if material_textures:
                 for mat, tex in material_textures.items():
@@ -1367,14 +2337,141 @@ def write_obj_mtl(
                     f.write("d 1.0\n")
                     f.write("illum 1\n")
                     f.write(f"map_Kd {tex}\n\n")
+                    tex_path = out_base.with_name(tex)
+                    if _png_has_alpha(tex_path):
+                        f.write(f"map_d {tex}\n\n")
             else:
-                f.write("newmtl mat0\n")
+                f.write(f"newmtl {default_mat_name}\n")
                 f.write("Ka 1.0 1.0 1.0\n")
                 f.write("Kd 1.0 1.0 1.0\n")
                 f.write("Ks 0.0 0.0 0.0\n")
                 f.write("d 1.0\n")
                 f.write("illum 1\n")
                 f.write(f"map_Kd {tex_name}\n")
+                tex_path = out_base.with_name(tex_name)
+                if _png_has_alpha(tex_path):
+                    f.write(f"map_d {tex_name}\n")
+
+
+def _rewrite_obj_face_token(tok: str, base_v: int, base_vt: int, base_vn: int) -> str:
+    parts = tok.split("/")
+    out: List[str] = []
+    for i, p in enumerate(parts):
+        if p == "":
+            out.append("")
+            continue
+        try:
+            idx = int(p)
+        except Exception:
+            out.append(p)
+            continue
+        if idx <= 0:
+            out.append(p)
+            continue
+        if i == 0:
+            out.append(str(idx + base_v))
+        elif i == 1:
+            out.append(str(idx + base_vt))
+        else:
+            out.append(str(idx + base_vn))
+    return "/".join(out)
+
+
+def _merge_model_objs(models: Sequence[Dict[str, object]], out_base: pathlib.Path) -> Optional[Dict[str, object]]:
+    valid: List[Dict[str, object]] = []
+    for m in models:
+        obj = pathlib.Path(str(m.get("obj", "")))
+        if obj.exists():
+            valid.append(m)
+    if len(valid) < 2:
+        return None
+
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    obj_out = out_base.with_suffix(".obj")
+    mtl_out = out_base.with_suffix(".mtl")
+
+    # Merge MTL blocks by unique material name.
+    seen_mtls: set[str] = set()
+    merged_mtl_lines: List[str] = []
+    for m in valid:
+        mtl_s = m.get("mtl")
+        if not mtl_s:
+            continue
+        mtl_path = pathlib.Path(str(mtl_s))
+        if not mtl_path.exists():
+            continue
+        cur_name: Optional[str] = None
+        cur_lines: List[str] = []
+        for ln in mtl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.startswith("newmtl "):
+                if cur_name is not None and cur_name not in seen_mtls and cur_lines:
+                    merged_mtl_lines.extend(cur_lines)
+                    merged_mtl_lines.append("")
+                    seen_mtls.add(cur_name)
+                cur_name = ln.split(" ", 1)[1].strip()
+                cur_lines = [ln]
+            else:
+                if cur_name is not None:
+                    cur_lines.append(ln)
+        if cur_name is not None and cur_name not in seen_mtls and cur_lines:
+            merged_mtl_lines.extend(cur_lines)
+            merged_mtl_lines.append("")
+            seen_mtls.add(cur_name)
+
+    out_lines: List[str] = []
+    if merged_mtl_lines:
+        out_lines.append(f"mtllib {mtl_out.name}")
+
+    total_v = 0
+    total_vt = 0
+    total_vn = 0
+    merged_tris = 0
+
+    for m in valid:
+        name = str(m.get("name", "part"))
+        obj_path = pathlib.Path(str(m.get("obj", "")))
+        if not obj_path.exists():
+            continue
+        base_v = total_v
+        base_vt = total_vt
+        base_vn = total_vn
+        out_lines.append(f"o {name}")
+        for ln in obj_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if ln.startswith("mtllib "):
+                continue
+            if ln.startswith("v "):
+                out_lines.append(ln)
+                total_v += 1
+                continue
+            if ln.startswith("vt "):
+                out_lines.append(ln)
+                total_vt += 1
+                continue
+            if ln.startswith("vn "):
+                out_lines.append(ln)
+                total_vn += 1
+                continue
+            if ln.startswith("f "):
+                toks = ln.split()[1:]
+                rt = [_rewrite_obj_face_token(tk, base_v, base_vt, base_vn) for tk in toks]
+                out_lines.append("f " + " ".join(rt))
+                merged_tris += 1
+                continue
+            if ln.startswith("usemtl ") or ln.startswith("g ") or ln.startswith("s "):
+                out_lines.append(ln)
+
+    obj_out.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    if merged_mtl_lines:
+        mtl_out.write_text("\n".join(merged_mtl_lines) + "\n", encoding="utf-8")
+
+    return {
+        "name": out_base.name,
+        "obj": str(obj_out),
+        "mtl": str(mtl_out) if merged_mtl_lines else None,
+        "source_models": [str(m.get("name")) for m in valid],
+        "source_count": len(valid),
+        "tri_count": merged_tris,
+    }
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -1392,42 +2489,77 @@ def cmd_export_model(args: argparse.Namespace) -> int:
     out_base.parent.mkdir(parents=True, exist_ok=True)
 
     tri_states: List[Optional[TexState]] = []
+    tri_uv_info: List[UvInfo] = []
     if args.texture:
-        verts, tris, stats, tri_states = parse_model_with_texstates(blob)
+        verts, tris, stats, tri_states, tri_uv_info = parse_model_with_texstates(blob)
     else:
         verts, tris, stats = parse_model(blob)
     pruned_tris = 0
     if args.strict_mesh:
         if tri_states:
-            verts, tris, tri_states, pruned_tris = _prune_outlier_tris_with_states(verts, tris, tri_states)
+            verts, tris, tri_states, tri_uv_info, pruned_tris = _prune_outlier_tris_with_states(
+                verts, tris, tri_states, tri_uv_info=tri_uv_info
+            )
         else:
             verts, tris, pruned_tris = _prune_outlier_tris(verts, tris)
         if not mesh_quality_strict_ok(verts, tris):
             raise ValueError("strict mesh checks failed for this model")
+    textured_tri_ratio = 0.0
+    if tri_states:
+        textured_tri_ratio = sum(1 for st in tri_states if st is not None) / max(1, len(tris))
+
     wrote_texture = False
     tri_mats: Optional[List[str]] = None
     mat_tex: Optional[Dict[str, str]] = None
     texture_materials = 0
+    tri_uv_areas: Optional[List[float]] = None
+    uv_out_ratio = 0.0
+    if tri_uv_info:
+        tri_uv_areas = _tri_uv_areas(verts, tris, tri_uv_info)
+        uv_out_ratio = _uv_out_of_range_ratio(verts, tris, tri_uv_info)
+
+    textured_tri_ratio = 0.0
+    if tri_states:
+        textured_tri_ratio = sum(1 for st in tri_states if st is not None) / max(1, len(tris))
+
     if args.texture:
         if Image is None:
             raise RuntimeError("Pillow is required for PNG texture export: pip install pillow")
         try:
-            tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(blob, out_base, tri_states)
+            tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(
+                blob, out_base, tri_states, tri_uv_areas=tri_uv_areas
+            )
             if tri_mats and mat_tex:
                 wrote_texture = True
             else:
-                try:
-                    pixels, w, h = extract_ci4_texture_from_dl(blob, dl_off=8)
-                except Exception:
-                    pixels, w, h = extract_ci4_texture(blob)
-                img = Image.new("RGBA", (w, h))
-                img.putdata(pixels)
-                img.save(out_base.with_suffix(".png"))
+                best = _best_texture_from_tri_states(blob, tri_states, tri_uv_areas=tri_uv_areas)
+                if best is not None:
+                    pixels, w, h = best
+                else:
+                    try:
+                        pixels, w, h = extract_ci4_texture_from_dl(blob, dl_off=8)
+                    except Exception:
+                        pixels, w, h = extract_ci4_texture(blob)
+                _save_texture_png(out_base.with_suffix(".png"), pixels, w, h)
                 wrote_texture = True
         except Exception:
             wrote_texture = False
 
-    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture, tri_materials=tri_mats, material_textures=mat_tex)
+    write_obj_mtl(
+        out_base,
+        verts,
+        tris,
+        with_texture=wrote_texture,
+        tri_materials=tri_mats,
+        material_textures=mat_tex,
+        tri_uv_info=tri_uv_info if tri_uv_info else None,
+    )
+    mesh_penalty = _mesh_topology_penalty(verts, tris)
+    mesh_long = float(_mesh_spaghetti_metrics(verts, tris).get("long_edge_ratio", 1.0))
+    mesh_conf = 1.0 / (1.0 + mesh_penalty + (2.0 * mesh_long) + (2.0 * uv_out_ratio))
+    tex_conf = 0.0
+    if wrote_texture:
+        tex_conf = 0.9 if texture_materials > 0 else 0.6
     print(
         json.dumps(
             {
@@ -1438,6 +2570,12 @@ def cmd_export_model(args: argparse.Namespace) -> int:
                 "pruned_outlier_tris": pruned_tris,
                 "texture": wrote_texture,
                 "texture_materials": texture_materials,
+                "mesh_penalty": mesh_penalty,
+                "mesh_long_edge_ratio": mesh_long,
+                "mesh_confidence": mesh_conf,
+                "uv_out_of_range_ratio": uv_out_ratio,
+                "textured_tri_ratio": textured_tri_ratio,
+                "texture_confidence": tex_conf,
             },
             indent=2,
         )
@@ -1465,12 +2603,16 @@ def _export_one_model(
     forced_tri_mode: Optional[str] = None,
     disable_prune: bool = False,
     prune_mode: str = "full",
+    full_rom: Optional[bytes] = None,
+    yay0_offset: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
     starts: List[int] = []
     for s in [rom_off, max(0, rom_off - 8), max(0, rom_off - 16)]:
         if s in starts:
             continue
         starts.append(s)
+    if rom_off < window and 0 not in starts:
+        starts.append(0)
 
     best: Optional[Tuple[List[Vtx], List[Tri], Dict[str, int], int, int, str, float, float]] = None
     candidates: List[Tuple[List[Vtx], List[Tri], Dict[str, int], int, int, str, float, float]] = []
@@ -1568,14 +2710,50 @@ def _export_one_model(
 
     verts, tris, stats, dl_used, base_used, tri_mode_used, _pen_used, _long_used = best
     tri_states: List[Optional[TexState]] = []
+    tri_uv_info: List[UvInfo] = []
+    chunk_tex_for_decode: Optional[bytes] = None
+    seg_base_hint: Optional[Dict[int, int]] = None
     if texture:
         try:
             chunk_tex = rom[base_used : base_used + window + 16]
-            v2, t2, _s2, ts2 = parse_model_with_texstates(chunk_tex, dl_off=dl_used, tri_div2=(tri_mode_used == "div2"))
-            if len(v2) == len(verts) and len(t2) == len(tris):
+            cand: List[Tuple[bytes, Optional[Dict[int, int]]]] = [(chunk_tex, None)]
+            if full_rom is not None and yay0_offset is not None:
+                for c_blob, c_hint, _c_base in _seg4_bridge_candidates(
+                    local_blob=chunk_tex,
+                    full_rom=full_rom,
+                    yay0_off=int(yay0_offset),
+                    dl_off=dl_used,
+                ):
+                    cand.append((c_blob, c_hint))
+
+            best_pick: Optional[Tuple[float, bytes, Optional[Dict[int, int]], List[Optional[TexState]], List[UvInfo]]] = None
+            for c_blob, c_hint in cand:
+                try:
+                    v2, t2, _s2, ts2, uv2 = parse_model_with_texstates(
+                        c_blob,
+                        dl_off=dl_used,
+                        tri_div2=(tri_mode_used == "div2"),
+                        seg_bases_init=c_hint,
+                    )
+                except Exception:
+                    continue
+                if len(v2) != len(verts) or len(t2) != len(tris):
+                    continue
+                score = _tri_state_decode_score(c_blob, ts2)
+                if best_pick is None or score < best_pick[0]:
+                    best_pick = (score, c_blob, c_hint, ts2, uv2)
+
+            if best_pick is not None:
+                _s, c_blob, c_hint, ts2, uv2 = best_pick
+                chunk_tex_for_decode = c_blob
+                seg_base_hint = c_hint
                 tri_states = ts2
+                tri_uv_info = uv2
+            else:
+                chunk_tex_for_decode = chunk_tex
         except Exception:
             tri_states = []
+            tri_uv_info = []
     if stats["tri_count"] <= 0 or stats["vert_count"] <= 0:
         return None
 
@@ -1583,7 +2761,9 @@ def _export_one_model(
     if strict_mesh:
         if not disable_prune:
             if tri_states:
-                verts, tris, tri_states, pruned_tris = _prune_outlier_tris_with_states(verts, tris, tri_states, mode=prune_mode)
+                verts, tris, tri_states, tri_uv_info, pruned_tris = _prune_outlier_tris_with_states(
+                    verts, tris, tri_states, tri_uv_info=tri_uv_info, mode=prune_mode
+                )
             else:
                 verts, tris, pruned_tris = _prune_outlier_tris(verts, tris, mode=prune_mode)
         stats["tri_count"] = len(tris)
@@ -1599,30 +2779,68 @@ def _export_one_model(
     if standalone_only and (int(stats.get("external_matrix_refs", 0)) > 0 or int(stats.get("external_dl_refs", 0)) > 0):
         return None
 
+    tri_uv_areas: Optional[List[float]] = None
+    uv_out_ratio = 0.0
+    if tri_uv_info:
+        tri_uv_areas = _tri_uv_areas(verts, tris, tri_uv_info)
+        uv_out_ratio = _uv_out_of_range_ratio(verts, tris, tri_uv_info)
+
+    textured_tri_ratio = 0.0
+    if tri_states:
+        textured_tri_ratio = sum(1 for st in tri_states if st is not None) / max(1, len(tris))
+
     wrote_texture = False
     tri_mats: Optional[List[str]] = None
     mat_tex: Optional[Dict[str, str]] = None
     texture_materials = 0
     if texture and Image is not None:
         try:
-            chunk_tex = rom[base_used : base_used + window + 16]
+            chunk_tex = chunk_tex_for_decode if chunk_tex_for_decode is not None else rom[base_used : base_used + window + 16]
             if tri_states:
-                tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(chunk_tex, out_base, tri_states)
+                tri_mats, mat_tex, texture_materials = _build_materials_from_tri_states(
+                    chunk_tex, out_base, tri_states, tri_uv_areas=tri_uv_areas
+                )
+                if tri_mats and tri_uv_info:
+                    _apply_known_texture_fixes(
+                        yay0_offset=yay0_offset,
+                        rom_off=rom_off,
+                        verts=verts,
+                        tris=tris,
+                        tri_states=tri_states,
+                        tri_mats=tri_mats,
+                        tri_uv_info=tri_uv_info,
+                    )
             if tri_mats and mat_tex:
                 wrote_texture = True
             else:
-                try:
-                    pixels, w, h = extract_ci4_texture_from_dl(chunk_tex, dl_off=dl_used)
-                except Exception:
-                    pixels, w, h = extract_ci4_texture(chunk_tex)
-                img = Image.new("RGBA", (w, h))
-                img.putdata(pixels)
-                img.save(out_base.with_suffix(".png"))
+                best = _best_texture_from_tri_states(chunk_tex, tri_states, tri_uv_areas=tri_uv_areas)
+                if best is not None:
+                    pixels, w, h = best
+                else:
+                    try:
+                        pixels, w, h = extract_ci4_texture_from_dl(chunk_tex, dl_off=dl_used)
+                    except Exception:
+                        pixels, w, h = extract_ci4_texture(chunk_tex)
+                _save_texture_png(out_base.with_suffix(".png"), pixels, w, h)
                 wrote_texture = True
         except Exception:
             wrote_texture = False
 
-    write_obj_mtl(out_base, verts, tris, with_texture=wrote_texture, tri_materials=tri_mats, material_textures=mat_tex)
+    write_obj_mtl(
+        out_base,
+        verts,
+        tris,
+        with_texture=wrote_texture,
+        tri_materials=tri_mats,
+        material_textures=mat_tex,
+        tri_uv_info=tri_uv_info if tri_uv_info else None,
+    )
+    mesh_penalty = _mesh_topology_penalty(verts, tris)
+    mesh_long = float(_mesh_spaghetti_metrics(verts, tris).get("long_edge_ratio", 1.0))
+    mesh_conf = 1.0 / (1.0 + mesh_penalty + (2.0 * mesh_long) + (2.0 * uv_out_ratio))
+    tex_conf = 0.0
+    if wrote_texture:
+        tex_conf = 0.9 if texture_materials > 0 else 0.6
     return {
         "rom_offset": rom_off,
         "name": out_base.name,
@@ -1644,6 +2862,12 @@ def _export_one_model(
         "base_offset_used": base_used,
         "tri_index_mode": tri_mode_used,
         "texture_materials": texture_materials,
+        "mesh_penalty": mesh_penalty,
+        "mesh_long_edge_ratio": mesh_long,
+        "mesh_confidence": mesh_conf,
+        "uv_out_of_range_ratio": uv_out_ratio,
+        "textured_tri_ratio": textured_tri_ratio,
+        "texture_confidence": tex_conf,
         "bbox": _bbox(verts),
     }
 
@@ -1745,6 +2969,9 @@ def cmd_batch_models_yay0(args: argparse.Namespace) -> int:
                     (0x00AFEBA0, 0x10): "div2",
                     (0x00B00C4C, 0x10): "div2",
                     (0x00B22EB4, 0x10): "div2",
+                    (0x00B22068, 0x10): "div2",
+                    (0x00B22068, 0x1A0): "div2",
+                    (0x00B22068, 0x2B0): "div2",
                 }
                 prune_disable_overrides: Dict[Tuple[int, int], bool] = {
                     # Keep pruning enabled for y0516, but with a gentler mode.
@@ -1770,6 +2997,8 @@ def cmd_batch_models_yay0(args: argparse.Namespace) -> int:
                         forced_tri_mode=forced_mode,
                         disable_prune=disable_prune,
                         prune_mode=prune_mode,
+                        full_rom=rom,
+                        yay0_offset=yoff,
                     )
                     if info is None:
                         continue
@@ -1787,6 +3016,10 @@ def cmd_batch_models_yay0(args: argparse.Namespace) -> int:
                     continue
             chunk_info["models"] = models
             chunk_info["model_count"] = len(models)
+            if args.merge_chunk_models and len(models) >= 2:
+                merged_base = out_dir / f"y{yi:04d}_{yoff:08X}_merged"
+                merged = _merge_model_objs(models, merged_base)
+                chunk_info["merged"] = merged
         except Exception as ex:
             chunk_info["error"] = str(ex)
         cast_chunks = manifest["chunks"]
@@ -2104,6 +3337,63 @@ def _ci4_to_l8(data: bytes, lohi: bool = False) -> List[int]:
     return pix
 
 
+def _l8_to_ci4_idx(samples: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    for v in samples:
+        i = int(round(float(v) / 17.0))
+        if i < 0:
+            i = 0
+        elif i > 15:
+            i = 15
+        out.append(i)
+    return out
+
+
+def _ci4_idx_to_l8(indices: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    for i in indices:
+        ii = int(i)
+        if ii < 0:
+            ii = 0
+        elif ii > 15:
+            ii = 15
+        out.append(ii * 17)
+    return out
+
+
+def _paint_mode_filter_indices(samples: Sequence[int], w: int, h: int, radius: int = 1, passes: int = 1) -> List[int]:
+    if radius <= 0 or passes <= 0:
+        return list(samples)
+    cur = [int(v) for v in samples]
+    for _ in range(passes):
+        out = cur[:]
+        for y in range(h):
+            y0 = max(0, y - radius)
+            y1 = min(h - 1, y + radius)
+            for x in range(w):
+                x0 = max(0, x - radius)
+                x1 = min(w - 1, x + radius)
+                bins = [0] * 16
+                for yy in range(y0, y1 + 1):
+                    row = yy * w
+                    for xx in range(x0, x1 + 1):
+                        v = cur[row + xx]
+                        if v < 0:
+                            v = 0
+                        elif v > 15:
+                            v = 15
+                        bins[v] += 1
+                best_i = 0
+                best_c = -1
+                for i, c in enumerate(bins):
+                    if c > best_c:
+                        best_c = c
+                        best_i = i
+                out[y * w + x] = best_i
+        cur = out
+    return cur
+
+
 def _ci4_row_xor_bytes(data: bytes, w: int, h: int, xorv: int) -> bytes:
     row_bytes = w // 2
     if len(data) != row_bytes * h:
@@ -2139,6 +3429,166 @@ def _xy_absdiff(samples: Sequence[int], w: int, h: int) -> Tuple[float, float]:
     return ax, ay
 
 
+def _grid_seam_penalty(samples: Sequence[int], w: int, h: int, periods: Sequence[int]) -> float:
+    # Penalize strong seams at regular tile boundaries (common bad untile symptom).
+    ax, ay = _xy_absdiff(samples, w, h)
+    base = max(1.0, 0.5 * (ax + ay))
+    worst = 0.0
+    for p in periods:
+        if p <= 1:
+            continue
+        sx = 0
+        cx = 0
+        sy = 0
+        cy = 0
+        for y in range(h):
+            row = y * w
+            for x in range(p - 1, w - 1, p):
+                sx += abs(int(samples[row + x]) - int(samples[row + x + 1]))
+                cx += 1
+        for y in range(p - 1, h - 1, p):
+            row = y * w
+            for x in range(w):
+                sy += abs(int(samples[row + x]) - int(samples[row + w + x]))
+                cy += 1
+        if cx == 0 and cy == 0:
+            continue
+        seam = 0.0
+        n = 0
+        if cx:
+            seam += sx / cx
+            n += 1
+        if cy:
+            seam += sy / cy
+            n += 1
+        seam /= max(1, n)
+        # Ignore minor boundary contrast; penalize only clear seam amplification.
+        excess = max(0.0, (seam / base) - 1.25)
+        worst = max(worst, excess)
+    return min(1.5, worst)
+
+
+def _periodic_repeat_penalty(samples: Sequence[int], w: int, h: int, max_val: float, shifts: Sequence[int]) -> float:
+    # Penalize layouts that repeat at fixed shifts (duplicate/scrambled tiles).
+    best = 0.0
+    denom = max(1.0, float(max_val))
+    for shift in shifts:
+        if shift >= w and shift >= h:
+            continue
+        total = 0
+        cnt = 0
+        if shift < w:
+            for y in range(h):
+                row = y * w
+                for x in range(w - shift):
+                    total += abs(int(samples[row + x]) - int(samples[row + x + shift]))
+                    cnt += 1
+        if shift < h:
+            for y in range(h - shift):
+                row = y * w
+                row2 = (y + shift) * w
+                for x in range(w):
+                    total += abs(int(samples[row + x]) - int(samples[row2 + x]))
+                    cnt += 1
+        if cnt <= 0:
+            continue
+        d = (total / cnt) / denom
+        # Very low shift-diff strongly indicates repeated blocks.
+        p = max(0.0, (0.03 - d) / 0.03)
+        best = max(best, p)
+    return best
+
+
+def _row_xor_words(samples: Sequence[int], w: int, h: int, xorv: int) -> List[int]:
+    # Reorder odd rows by XORing x index; mirrors common N64 row swizzle artifacts.
+    out = [0] * (w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            sx = (x ^ xorv) if (y & 1) else x
+            if sx >= w:
+                sx = x
+            out[row + x] = int(samples[row + sx])
+    return out
+
+
+def _row_unzip_evenodd(samples: Sequence[int], w: int, h: int, odd_first: bool = False) -> List[int]:
+    # Convert interlaced row order [e0,o0,e1,o1,...] into [e0,e1,...,o0,o1,...].
+    if h <= 1:
+        return list(samples)
+    out = [0] * (w * h)
+    half = h // 2
+    if not odd_first:
+        even_src = 0
+        odd_src = 1
+    else:
+        even_src = 1
+        odd_src = 0
+    for y in range(half):
+        src_e = (2 * y + even_src) * w
+        src_o = (2 * y + odd_src) * w
+        out[y * w : (y + 1) * w] = samples[src_e : src_e + w]
+        out[(half + y) * w : (half + y + 1) * w] = samples[src_o : src_o + w]
+    if h & 1:
+        out[(h - 1) * w : h * w] = samples[(h - 1) * w : h * w]
+    return out
+
+
+def _row_zip_evenodd(samples: Sequence[int], w: int, h: int, odd_first: bool = False) -> List[int]:
+    # Convert field-packed order [all even rows][all odd rows] into interlaced rows.
+    if h <= 1:
+        return list(samples)
+    out = [0] * (w * h)
+    half = h // 2
+    for y in range(half):
+        src_e = y * w
+        src_o = (half + y) * w
+        if not odd_first:
+            dst_e = (2 * y) * w
+            dst_o = (2 * y + 1) * w
+        else:
+            dst_e = (2 * y + 1) * w
+            dst_o = (2 * y) * w
+        out[dst_e : dst_e + w] = samples[src_e : src_e + w]
+        out[dst_o : dst_o + w] = samples[src_o : src_o + w]
+    if h & 1:
+        out[(h - 1) * w : h * w] = samples[(h - 1) * w : h * w]
+    return out
+
+
+def _row_interlace_penalty(samples: Sequence[int], w: int, h: int, max_val: float) -> float:
+    # Penalize comb-like horizontal striping: row(y) and row(y+2) too similar vs row(y+1).
+    if h < 3:
+        return 0.0
+    d1 = 0.0
+    c1 = 0
+    d2 = 0.0
+    c2 = 0
+    for y in range(h - 1):
+        r0 = y * w
+        r1 = (y + 1) * w
+        for x in range(w):
+            d1 += abs(int(samples[r0 + x]) - int(samples[r1 + x]))
+            c1 += 1
+    for y in range(h - 2):
+        r0 = y * w
+        r2 = (y + 2) * w
+        for x in range(w):
+            d2 += abs(int(samples[r0 + x]) - int(samples[r2 + x]))
+            c2 += 1
+    if c1 == 0 or c2 == 0:
+        return 0.0
+    a1 = d1 / c1
+    a2 = d2 / c2
+    # If adjacent-row differences are much larger than 2-row differences, likely interlaced stripes.
+    ratio = a1 / max(1.0, a2)
+    return max(0.0, min(2.0, (ratio - 1.25) / 1.75))
+
+
+def _u16_periodic_repeat_penalty(samples: Sequence[int], w: int, h: int) -> float:
+    return _periodic_repeat_penalty(samples, w, h, 65535.0, shifts=[8, 16, 32, 64])
+
+
 def _paint_artifact_score(samples: Sequence[int], w: int, h: int) -> float:
     # Lower is better. Penalize striping/checkerboard + isolated-pixel noise.
     ax, ay = _xy_absdiff(samples, w, h)
@@ -2170,7 +3620,11 @@ def _paint_artifact_score(samples: Sequence[int], w: int, h: int) -> float:
     pmean_o = (parity_odd / co) if co else 0.0
     parity_bias = abs(pmean_e - pmean_o) / 255.0
     isolated_noise = ((isolated / isolated_n) / 255.0) if isolated_n else 0.0
-    return (1.8 * aniso) + (0.7 * variation) + (1.3 * parity_bias) + (1.1 * isolated_noise)
+    seam = _grid_seam_penalty(samples, w, h, periods=[4, 8, 16, 32])
+    repeat = _periodic_repeat_penalty(samples, w, h, 255.0, shifts=[8, 16, 32, 64])
+    interlace = _row_interlace_penalty(samples, w, h, 255.0)
+    grain = max(0.0, variation - 0.20) * max(0.0, isolated_noise - 0.18) * 6.0
+    return (1.8 * aniso) + (0.7 * variation) + (1.3 * parity_bias) + (1.1 * isolated_noise) + (1.2 * seam) + (0.8 * repeat) + (1.1 * interlace) + grain
 
 
 def _paint_variant_name_penalty(name: str) -> float:
@@ -2179,12 +3633,51 @@ def _paint_variant_name_penalty(name: str) -> float:
         p += 0.030
     if name.endswith("_linear"):
         p += 0.008
+    if "untile_linear_ts32" in name:
+        p += 0.060
+    elif "untile_linear_ts16" in name:
+        p += 0.020
+    elif "untile_morton_ts16" in name:
+        p += 0.010
     m = re.search(r"rowxor(\d+)_", name)
     if m:
         xv = int(m.group(1))
         if xv != 1:
             p += 0.010 + (0.002 * min(15, abs(xv - 1)))
     return p
+
+
+def _paint_entropy16_norm(samples: Sequence[int]) -> float:
+    # CI4-style entropy over 16 bins, normalized to [0,1].
+    bins = [0] * 16
+    n = len(samples)
+    if n <= 0:
+        return 0.0
+    for v in samples:
+        i = int(round(float(v) / 17.0))
+        if i < 0:
+            i = 0
+        elif i > 15:
+            i = 15
+        bins[i] += 1
+    ent = 0.0
+    for c in bins:
+        if c <= 0:
+            continue
+        p = float(c) / float(n)
+        ent -= p * math.log2(p)
+    return ent / 4.0
+
+
+def _paint_static_like(samples: Sequence[int], w: int, h: int) -> bool:
+    # Heuristic for salt/pepper-like random index noise.
+    ax, ay = _xy_absdiff(samples, w, h)
+    variation = (ax + ay) / (2.0 * 255.0)
+    aniso = abs(ax - ay) / max(1.0, ax + ay)
+    ent = _paint_entropy16_norm(samples)
+    hi_entropy_noise = (ent > 0.93 and variation > 0.24 and aniso < 0.22)
+    lo_entropy_saltpepper = (ent < 0.70 and variation > 0.22 and aniso < 0.25)
+    return bool(hi_entropy_noise or lo_entropy_saltpepper)
 
 
 def _ci4_variant_images(data8192: bytes, w: int = 128, h: int = 128) -> List[Dict[str, object]]:
@@ -2252,11 +3745,14 @@ def _u16_layout_score(samples: Sequence[int], w: int, h: int) -> float:
     # Heightmaps should be smooth relative to the 16-bit depth (65535).
     smooth = _neighbor_absdiff_score(samples, w, h)
     dup = _u16_dup_score(samples, w, h)
+    repeat = _u16_periodic_repeat_penalty(samples, w, h)
+    seam = _grid_seam_penalty(samples, w, h, periods=[8, 16, 32])
+    interlace = _row_interlace_penalty(samples, w, h, 65535.0)
     # Prefer square-ish layouts.
     aspect_penalty = 0.08 * abs(math.log2(max(w, h) / max(1, min(w, h))))
     # Penalty for noise and suspiciously high duplication.
     # Lower is better.
-    return (10.0 * smooth) + aspect_penalty + (0.5 * max(0.0, 0.1 - dup))
+    return (10.0 * smooth) + aspect_penalty + (0.5 * max(0.0, 0.1 - dup)) + (0.9 * repeat) + (0.7 * seam) + (1.0 * interlace)
 
 
 def _parse_dim_list(spec: str, total_px: int) -> List[Tuple[int, int]]:
@@ -2316,6 +3812,73 @@ def _write_l8(path: pathlib.Path, w: int, h: int, data: Sequence[int]) -> None:
     img.save(path)
 
 
+def _write_l8_resized(path: pathlib.Path, src_w: int, src_h: int, dst_w: int, dst_h: int, data: Sequence[int]) -> None:
+    if Image is None:
+        raise RuntimeError("Pillow is required for PNG export: pip install pillow")
+    img = Image.new("L", (src_w, src_h))
+    img.putdata(list(data))
+    img = img.resize((dst_w, dst_h), resample=Image.NEAREST)
+    img.save(path)
+
+
+def _parse_offset_regex(items: Sequence[str]) -> Dict[int, re.Pattern[str]]:
+    out: Dict[int, re.Pattern[str]] = {}
+    for it in items:
+        if ":" not in it:
+            continue
+        a, b = it.split(":", 1)
+        try:
+            off = int(a.strip(), 0)
+            pat = re.compile(b.strip())
+        except Exception:
+            continue
+        out[off] = pat
+    return out
+
+
+def _variant_bias(off: int, name: str, rules: Dict[int, re.Pattern[str]], bonus: float = 0.35) -> float:
+    pat = rules.get(off)
+    if pat is None:
+        return 0.0
+    return (-bonus) if pat.search(name) else 0.0
+
+
+def _top_unique_variants(vars_in: Sequence[Dict[str, object]], topk: int) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    seen: set[str] = set()
+    for v in vars_in:
+        pix = v.get("pixels")
+        if not isinstance(pix, list):
+            continue
+        # Deduplicate by exported 8-bit appearance.
+        k = hashlib.md5(bytes(_u16_to_norm8(pix))).hexdigest()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(v)
+        if len(out) >= topk:
+            break
+    return out
+
+
+def _pick_preferred_variant(
+    off: int,
+    vars_in: Sequence[Dict[str, object]],
+    rules: Dict[int, re.Pattern[str]],
+    fallback: Dict[str, object],
+    score_gap: float = 0.50,
+) -> Dict[str, object]:
+    pat = rules.get(off)
+    if pat is None or not vars_in:
+        return fallback
+    base = float(vars_in[0].get("score", float("inf")))
+    for v in vars_in:
+        name = str(v.get("name", ""))
+        if pat.search(name) and float(v.get("score", float("inf"))) <= (base + score_gap):
+            return v
+    return fallback
+
+
 def cmd_height_candidates(args: argparse.Namespace) -> int:
     rom = pathlib.Path(args.rom).read_bytes()
     out_dir = pathlib.Path(args.outdir)
@@ -2335,7 +3898,7 @@ def cmd_height_candidates(args: argparse.Namespace) -> int:
     headers = [o for o in find_yay0_headers(rom) if start <= o <= end]
     u16_offsets: List[int] = []
     blobs: Dict[int, bytes] = {}
-    for off in headers:
+    for yi, off in enumerate(headers):
         try:
             dec, _ = yay0_decompress(rom, off)
         except Exception:
@@ -2487,11 +4050,11 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
     other_records: List[Dict[str, object]] = []
     topk = max(1, int(args.paint_variants_top))
     u16_topk = max(1, int(args.u16_variants_top))
-    u16_dims = _parse_dim_list(args.u16_dims, 128 * 128)
-    if not u16_dims:
-        u16_dims = [(128, 128)]
+    light_pref = _parse_offset_regex(args.prefer_light_variant)
+    height_pref = _parse_offset_regex(args.prefer_height_variant)
+    paint_pref = _parse_offset_regex(args.prefer_paint_variant)
 
-    for off in headers:
+    for yi, off in enumerate(headers):
         try:
             dec, _ = yay0_decompress(rom, off)
         except Exception as ex:
@@ -2499,8 +4062,9 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             continue
 
         size = len(dec)
-        if size == 32768:
-            n = 128 * 128
+        u16_dims_local = _parse_dim_list(args.u16_dims, (size // 2)) if (size % 2) == 0 else []
+        if u16_dims_local:
+            n = size // 2
             be = [struct.unpack_from(">H", dec, i * 2)[0] for i in range(n)]
             le = [struct.unpack_from("<H", dec, i * 2)[0] for i in range(n)]
 
@@ -2513,7 +4077,7 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                 is_8bit = tag in ("hi", "lo")
                 scale = 256 if is_8bit else 1
 
-                for (w, h) in u16_dims:
+                for (w, h) in u16_dims_local:
                     base = [v * scale for v in vals]
                     rows.append({
                         "name": f"{tag}_linear_{w}x{h}",
@@ -2522,6 +4086,30 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                         "score": _u16_layout_score(base, w, h),
                         "is_8bit": is_8bit,
                     })
+                    rows.append({
+                        "name": f"{tag}_linear_zipeo_{w}x{h}",
+                        "w": w, "h": h,
+                        "pixels": _row_zip_evenodd(base, w, h, odd_first=False),
+                        "score": _u16_layout_score(_row_zip_evenodd(base, w, h, odd_first=False), w, h),
+                        "is_8bit": is_8bit,
+                    })
+                    rows.append({
+                        "name": f"{tag}_linear_unzipoe_{w}x{h}",
+                        "w": w, "h": h,
+                        "pixels": _row_unzip_evenodd(base, w, h, odd_first=True),
+                        "score": _u16_layout_score(_row_unzip_evenodd(base, w, h, odd_first=True), w, h),
+                        "is_8bit": is_8bit,
+                    })
+                    if tag in ("be", "le"):
+                        for xv in [1, 2, 4, 8, 16, 32]:
+                            p = _row_xor_words(base, w, h, xv)
+                            rows.append({
+                                "name": f"{tag}_rowxor{xv}_{w}x{h}",
+                                "w": w, "h": h,
+                                "pixels": p,
+                                "score": _u16_layout_score(p, w, h),
+                                "is_8bit": is_8bit,
+                            })
                     for ts in [2, 4, 8, 16, 32]:
                         if (w % ts) == 0 and (h % ts) == 0:
                             p = _untile_linear(base, w, h, ts)
@@ -2532,6 +4120,19 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                                 "score": _u16_layout_score(p, w, h),
                                 "is_8bit": is_8bit,
                             })
+                            for rn, rp in [
+                                ("zipeo", _row_zip_evenodd(p, w, h, odd_first=False)),
+                                ("zipoe", _row_zip_evenodd(p, w, h, odd_first=True)),
+                                ("unzipeo", _row_unzip_evenodd(p, w, h, odd_first=False)),
+                                ("unzipoe", _row_unzip_evenodd(p, w, h, odd_first=True)),
+                            ]:
+                                rows.append({
+                                    "name": f"{tag}_untile_linear_ts{ts}_{rn}_{w}x{h}",
+                                    "w": w, "h": h,
+                                    "pixels": rp,
+                                    "score": _u16_layout_score(rp, w, h),
+                                    "is_8bit": is_8bit,
+                                })
                     for ts in [4, 8, 16]:
                         if (w % ts) == 0 and (h % ts) == 0:
                             p = _untile_morton(base, w, h, ts)
@@ -2542,6 +4143,19 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                                 "score": _u16_layout_score(p, w, h),
                                 "is_8bit": is_8bit,
                             })
+                            for rn, rp in [
+                                ("zipeo", _row_zip_evenodd(p, w, h, odd_first=False)),
+                                ("zipoe", _row_zip_evenodd(p, w, h, odd_first=True)),
+                                ("unzipeo", _row_unzip_evenodd(p, w, h, odd_first=False)),
+                                ("unzipoe", _row_unzip_evenodd(p, w, h, odd_first=True)),
+                            ]:
+                                rows.append({
+                                    "name": f"{tag}_untile_morton_ts{ts}_{rn}_{w}x{h}",
+                                    "w": w, "h": h,
+                                    "pixels": rp,
+                                    "score": _u16_layout_score(rp, w, h),
+                                    "is_8bit": is_8bit,
+                                })
                 rows.sort(key=lambda r: float(r["score"]))
                 return rows
 
@@ -2549,6 +4163,23 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             le_vars = _u16_variants(le, "le")
             hi_vars = _u16_variants(hi, "hi")
             lo_vars = _u16_variants(lo, "lo")
+
+            for lst in (be_vars, le_vars, hi_vars, lo_vars):
+                for v in lst:
+                    name = str(v.get("name", ""))
+                    s = float(v.get("score", 0.0))
+                    # Global preference against very noisy large untile variants.
+                    if "_untile_linear_ts32_" in name:
+                        s += 0.080
+                    elif "_untile_linear_ts16_" in name:
+                        s += 0.020
+                    # Optional per-offset user calibration preferences.
+                    if name.startswith(("be_", "hi_")):
+                        s += _variant_bias(off, name, light_pref)
+                    if name.startswith(("le_", "lo_")):
+                        s += _variant_bias(off, name, height_pref)
+                    v["score"] = s
+                lst.sort(key=lambda r: float(r["score"]))
 
             # Collate all and pick the top two distinct "roles"
             all_v = sorted(be_vars + le_vars + hi_vars + lo_vars, key=lambda x: float(x["score"]))
@@ -2560,31 +4191,51 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             # Find best v2 that isn't the same prefix (e.g. if BE is best, find best LE/HI/LO)
             best_v2 = next((v for v in all_v if not v["name"].startswith(tag1)), all_v[min(1, len(all_v)-1)])
 
-            be_png = out_dir / f"{off:08X}_layer1_{best_v1['name']}.png"
-            le_png = out_dir / f"{off:08X}_layer2_{best_v2['name']}.png"
+            layer1_png = out_dir / f"{off:08X}_layer1_{best_v1['name']}.png"
+            layer2_png = out_dir / f"{off:08X}_layer2_{best_v2['name']}.png"
 
-            _write_l8(be_png, int(best_v1["w"]), int(best_v1["h"]), _u16_to_norm8(best_v1["pixels"]))
-            _write_l8(le_png, int(best_v2["w"]), int(best_v2["h"]), _u16_to_norm8(best_v2["pixels"]))
+            _write_l8(layer1_png, int(best_v1["w"]), int(best_v1["h"]), _u16_to_norm8(best_v1["pixels"]))
+            _write_l8(layer2_png, int(best_v2["w"]), int(best_v2["h"]), _u16_to_norm8(best_v2["pixels"]))
 
-            # Store info for this record
-            rec_detail = {
-                "offset": off,
-                "layer1_variant": best_v1["name"],
-                "layer2_variant": best_v2["name"],
-                "score_layer1": best_v1["score"],
-                "score_layer2": best_v2["score"],
-                "layer1_png": str(be_png),
-                "layer2_png": str(le_png),
-            }
+            # Keep explicit BE/LE exports for light/height compatibility.
+            be_best = be_vars[0]
+            le_best = le_vars[0]
+            be_png = out_dir / f"{off:08X}_light_{be_best['name']}.png"
+            le_png = out_dir / f"{off:08X}_height_{le_best['name']}.png"
+            _write_l8(be_png, int(be_best["w"]), int(be_best["h"]), _u16_to_norm8(be_best["pixels"]))
+            _write_l8(le_png, int(le_best["w"]), int(le_best["h"]), _u16_to_norm8(le_best["pixels"]))
+
+            light_best = min([be_vars[0], hi_vars[0]], key=lambda v: float(v["score"]))
+            # Prefer LE as height interpretation when scores are close; LO is often less stable.
+            height_best_base = min(
+                [le_vars[0], lo_vars[0]],
+                key=lambda v: float(v["score"]) + (0.020 if str(v["name"]).startswith("lo_") else 0.0),
+            )
+            height_pool = sorted(le_vars + lo_vars, key=lambda v: float(v["score"]))
+            height_best = _pick_preferred_variant(off, height_pool, height_pref, height_best_base, score_gap=0.65)
+            light_best_png = out_dir / f"{off:08X}_light_best_{light_best['name']}.png"
+            height_best_png = out_dir / f"{off:08X}_height_best_{height_best['name']}.png"
+            _write_l8(
+                light_best_png,
+                int(light_best["w"]),
+                int(light_best["h"]),
+                _u16_to_norm8(light_best["pixels"]),
+            )
+            _write_l8(
+                height_best_png,
+                int(height_best["w"]),
+                int(height_best["h"]),
+                _u16_to_norm8(height_best["pixels"]),
+            )
 
             be_saved: List[Dict[str, object]] = []
-            for v in be_vars[:u16_topk]:
+            for v in _top_unique_variants(be_vars, u16_topk):
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
                 _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 be_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
 
             le_saved: List[Dict[str, object]] = []
-            for v in le_vars[:u16_topk]:
+            for v in _top_unique_variants(le_vars, u16_topk):
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
                 _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 le_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
@@ -2595,7 +4246,9 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             # Use the best scores for classification
             if be_unique <= 96 and le_unique <= 96:
                 u16_class = "indexed_u16_paintlike"
-            elif float(all_v[0]["score"]) > 0.15: # Overall noisy
+            # After seam/repeat penalties, good terrain-like maps usually sit below
+            # ~0.85 in this score family; higher values are typically noisy/wrong decode.
+            elif float(all_v[0]["score"]) > 0.70:
                 u16_class = "noisy_or_unknown_u16"
             else:
                 u16_class = "terrain_u16_candidate"
@@ -2603,16 +4256,31 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             u16_records.append(
                 {
                     "offset": off,
+                    "yay0_offset": off,
+                    "yay0_index": yi,
                     "decompressed_size": size,
                     "raw_md5": _md5_hex(dec),
-                    "light_be_png": str(be_png), # Keep for compat
-                    "height_le_png": str(le_png), # Keep for compat
+                    "light_be_png": str(be_png),
+                    "height_le_png": str(le_png),
                     "score_be": float(be_vars[0]["score"]),
                     "score_le": float(le_vars[0]["score"]),
                     "score_hi": float(hi_vars[0]["score"]),
                     "score_lo": float(lo_vars[0]["score"]),
                     "best_variant": best_v1["name"],
                     "best_score": best_v1["score"],
+                    "u16_confidence": 1.0 / (1.0 + float(best_v1["score"])),
+                    "light_best_png": str(light_best_png),
+                    "light_best_variant": str(light_best["name"]),
+                    "light_best_score": float(light_best["score"]),
+                    "height_best_png": str(height_best_png),
+                    "height_best_variant": str(height_best["name"]),
+                    "height_best_score": float(height_best["score"]),
+                    "layer1_png": str(layer1_png),
+                    "layer2_png": str(layer2_png),
+                    "layer1_variant": best_v1["name"],
+                    "layer2_variant": best_v2["name"],
+                    "score_layer1": float(best_v1["score"]),
+                    "score_layer2": float(best_v2["score"]),
                     "layer1_dims": [int(best_v1["w"]), int(best_v1["h"])],
                     "layer2_dims": [int(best_v2["w"]), int(best_v2["h"])],
                     "be_variants": be_saved,
@@ -2625,56 +4293,196 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             )
             continue
 
-        if size == 8192:
-            variants = _ci4_variant_images(dec)
-            best = variants[0]
-            p = out_dir / f"{off:08X}_paint_{best['name']}.png"
-            _write_l8(p, 128, 128, best["pixels"])  # type: ignore[arg-type]
+        paint_dims_full = _parse_dim_list(args.paint_dims, size * 2)
+        if paint_dims_full:
+            use_denoise_score = int(args.paint_denoise_passes) > 0 and int(args.paint_denoise_radius) > 0
+            dim_variants: List[Dict[str, object]] = []
+            for (pw, ph) in paint_dims_full:
+                variants = _ci4_variant_images(dec, w=pw, h=ph)
+                for v in variants:
+                    n = str(v["name"])
+                    n2 = f"{n}_{pw}x{ph}"
+                    raw_pixels = v["pixels"]
+                    raw_score = float(v["score"])
+                    clean_pixels = None
+                    score_clean = raw_score
+                    if use_denoise_score:
+                        idx = _l8_to_ci4_idx(raw_pixels)  # type: ignore[arg-type]
+                        idx_clean = _paint_mode_filter_indices(
+                            idx,
+                            int(pw),
+                            int(ph),
+                            radius=int(args.paint_denoise_radius),
+                            passes=int(args.paint_denoise_passes),
+                        )
+                        clean_pixels = _ci4_idx_to_l8(idx_clean)
+                        score_clean = _paint_artifact_score(clean_pixels, int(pw), int(ph)) + _paint_variant_name_penalty(n)
+                    s = (score_clean if use_denoise_score else raw_score)
+                    s += _variant_bias(off, n, paint_pref)
+                    s += _variant_bias(off, n2, paint_pref)
+                    dim_variants.append(
+                        {
+                            "name": n,
+                            "score": s,
+                            "raw_score": raw_score,
+                            "score_clean": score_clean,
+                            "pixels": raw_pixels,
+                            "clean_pixels": clean_pixels,
+                            "w": int(pw),
+                            "h": int(ph),
+                            "name_with_dims": n2,
+                        }
+                    )
+            dim_variants.sort(key=lambda r: float(r["score"]))
+            best = dim_variants[0]
+            pw = int(best["w"])
+            ph = int(best["h"])
+            p = out_dir / f"{off:08X}_paint_{best['name_with_dims']}.png"
+            _write_l8(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
+            paint_square_png: Optional[pathlib.Path] = None
+            paint_clean_square_png: Optional[pathlib.Path] = None
+            side = int(round(math.sqrt(float(pw * ph))))
+            if pw != ph and (side * side) == (pw * ph):
+                p_square = out_dir / f"{off:08X}_paint_square_{best['name_with_dims']}_{side}x{side}.png"
+                _write_l8_resized(p_square, pw, ph, side, side, best["pixels"])  # type: ignore[arg-type]
+                paint_square_png = p_square
+            paint_clean_png: Optional[pathlib.Path] = None
+            if int(args.paint_denoise_passes) > 0 and int(args.paint_denoise_radius) > 0:
+                p_clean = out_dir / f"{off:08X}_paint_clean_{best['name_with_dims']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}.png"
+                clean_l8 = best.get("clean_pixels")
+                if clean_l8 is None:
+                    idx = _l8_to_ci4_idx(best["pixels"])  # type: ignore[arg-type]
+                    idx_clean = _paint_mode_filter_indices(
+                        idx,
+                        pw,
+                        ph,
+                        radius=int(args.paint_denoise_radius),
+                        passes=int(args.paint_denoise_passes),
+                    )
+                    clean_l8 = _ci4_idx_to_l8(idx_clean)
+                _write_l8(p_clean, pw, ph, clean_l8)
+                paint_clean_png = p_clean
+                if pw != ph and (side * side) == (pw * ph):
+                    p_clean_square = out_dir / f"{off:08X}_paint_clean_square_{best['name_with_dims']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}_{side}x{side}.png"
+                    _write_l8_resized(p_clean_square, pw, ph, side, side, clean_l8)
+                    paint_clean_square_png = p_clean_square
             variant_files: List[Dict[str, object]] = []
-            for v in variants[:topk]:
-                vp = out_dir / f"{off:08X}_paint_{v['name']}.png"
+            for v in _top_unique_variants(dim_variants, topk):
+                vp = out_dir / f"{off:08X}_paint_{v['name_with_dims']}.png"
                 if str(vp) != str(p):
-                    _write_l8(vp, 128, 128, v["pixels"])  # type: ignore[arg-type]
-                variant_files.append({"name": v["name"], "score": v["score"], "png": str(vp)})
+                    _write_l8(vp, int(v["w"]), int(v["h"]), v["pixels"])  # type: ignore[arg-type]
+                variant_files.append(
+                    {
+                        "name": v["name"],
+                        "name_with_dims": v["name_with_dims"],
+                        "score": v["score"],
+                        "dims": [int(v["w"]), int(v["h"])],
+                        "png": str(vp),
+                    }
+                )
             paint_records.append(
                 {
                     "offset": off,
-                    "kind": "ci4_128x128",
+                    "yay0_offset": off,
+                    "yay0_index": yi,
+                    "kind": f"ci4_{pw}x{ph}",
                     "raw_md5": _md5_hex(dec),
+                    "paint_dims": [int(pw), int(ph)],
                     "paint_png": str(p),
+                    "paint_clean_png": (str(paint_clean_png) if paint_clean_png is not None else None),
+                    "paint_square_png": (str(paint_square_png) if paint_square_png is not None else None),
+                    "paint_clean_square_png": (str(paint_clean_square_png) if paint_clean_square_png is not None else None),
                     "paint_variant": best["name"],
+                    "paint_variant_with_dims": best["name_with_dims"],
                     "paint_score": best["score"],
+                    "paint_entropy16": _paint_entropy16_norm(best["pixels"]),  # type: ignore[arg-type]
+                    "paint_static_like": _paint_static_like(best["pixels"], pw, ph),  # type: ignore[arg-type]
+                    "paint_class": (
+                        "terrain_paint_candidate"
+                        if (float(best["score"]) <= 0.37 and not _paint_static_like(best["pixels"], pw, ph))  # type: ignore[arg-type]
+                        else "noisy_or_unknown_paint"
+                    ),
+                    "paint_confidence": 1.0 / (1.0 + float(best["score"])),
                     "paint_variants": variant_files,
                 }
             )
             continue
 
-        if size == 24576:
-            for part in range(3):
-                chunk = dec[part * 8192 : (part + 1) * 8192]
-                variants = _ci4_variant_images(chunk)
+        packed_done = False
+        for (pw, ph) in _parse_dim_list(args.paint_dims, 128 * 128) + _parse_dim_list(args.paint_dims, 256 * 256) + _parse_dim_list(args.paint_dims, 512 * 512):
+            part_bytes = (pw * ph) // 2
+            if part_bytes <= 0 or (size % part_bytes) != 0:
+                continue
+            parts = size // part_bytes
+            if parts <= 1:
+                continue
+            packed_done = True
+            for part in range(parts):
+                chunk = dec[part * part_bytes : (part + 1) * part_bytes]
+                variants = _ci4_variant_images(chunk, w=pw, h=ph)
                 best = variants[0]
                 p = out_dir / f"{off:08X}_part{part}_paint_{best['name']}.png"
-                _write_l8(p, 128, 128, best["pixels"])  # type: ignore[arg-type]
+                _write_l8(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
+                paint_square_png: Optional[pathlib.Path] = None
+                paint_clean_square_png: Optional[pathlib.Path] = None
+                side = int(round(math.sqrt(float(pw * ph))))
+                if pw != ph and (side * side) == (pw * ph):
+                    p_square = out_dir / f"{off:08X}_part{part}_paint_square_{best['name']}_{side}x{side}.png"
+                    _write_l8_resized(p_square, pw, ph, side, side, best["pixels"])  # type: ignore[arg-type]
+                    paint_square_png = p_square
+                paint_clean_png: Optional[pathlib.Path] = None
+                if int(args.paint_denoise_passes) > 0 and int(args.paint_denoise_radius) > 0:
+                    idx = _l8_to_ci4_idx(best["pixels"])  # type: ignore[arg-type]
+                    idx_clean = _paint_mode_filter_indices(
+                        idx,
+                        pw,
+                        ph,
+                        radius=int(args.paint_denoise_radius),
+                        passes=int(args.paint_denoise_passes),
+                    )
+                    p_clean = out_dir / f"{off:08X}_part{part}_paint_clean_{best['name']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}.png"
+                    clean_l8 = _ci4_idx_to_l8(idx_clean)
+                    _write_l8(p_clean, pw, ph, clean_l8)
+                    paint_clean_png = p_clean
+                    if pw != ph and (side * side) == (pw * ph):
+                        p_clean_square = out_dir / f"{off:08X}_part{part}_paint_clean_square_{best['name']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}_{side}x{side}.png"
+                        _write_l8_resized(p_clean_square, pw, ph, side, side, clean_l8)
+                        paint_clean_square_png = p_clean_square
                 variant_files: List[Dict[str, object]] = []
                 for v in variants[:topk]:
                     vp = out_dir / f"{off:08X}_part{part}_paint_{v['name']}.png"
                     if str(vp) != str(p):
-                        _write_l8(vp, 128, 128, v["pixels"])  # type: ignore[arg-type]
+                        _write_l8(vp, pw, ph, v["pixels"])  # type: ignore[arg-type]
                     variant_files.append({"name": v["name"], "score": v["score"], "png": str(vp)})
                 paint_records.append(
                     {
                         "offset": off,
+                        "yay0_offset": off,
+                        "yay0_index": yi,
                         "subpart": part,
-                        "approx_offset": off + (part * 8192),
-                        "kind": "ci4_3x128x128_part",
+                        "approx_offset": off + (part * part_bytes),
+                        "kind": f"ci4_{parts}x{pw}x{ph}_part",
                         "raw_md5": _md5_hex(chunk),
+                        "paint_dims": [int(pw), int(ph)],
                         "paint_png": str(p),
+                        "paint_clean_png": (str(paint_clean_png) if paint_clean_png is not None else None),
+                        "paint_square_png": (str(paint_square_png) if paint_square_png is not None else None),
+                        "paint_clean_square_png": (str(paint_clean_square_png) if paint_clean_square_png is not None else None),
                         "paint_variant": best["name"],
                         "paint_score": best["score"],
+                        "paint_entropy16": _paint_entropy16_norm(best["pixels"]),  # type: ignore[arg-type]
+                        "paint_static_like": _paint_static_like(best["pixels"], pw, ph),  # type: ignore[arg-type]
+                        "paint_class": (
+                            "terrain_paint_candidate"
+                            if (float(best["score"]) <= 0.37 and not _paint_static_like(best["pixels"], pw, ph))  # type: ignore[arg-type]
+                            else "noisy_or_unknown_paint"
+                        ),
+                        "paint_confidence": 1.0 / (1.0 + float(best["score"])),
                         "paint_variants": variant_files,
                     }
                 )
+            break
+        if packed_done:
             continue
 
         other_records.append({"offset": off, "decompressed_size": size})
@@ -2684,20 +4492,51 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
         paint_records,
         key=lambda r: int(r.get("approx_offset", r.get("offset", 0))),  # type: ignore[arg-type]
     )
+    paints_good = [p for p in paints_sorted if str(p.get("paint_class", "")) == "terrain_paint_candidate"]
+    paints_by_yay0: Dict[int, List[Dict[str, object]]] = {}
+    for p in paints_sorted:
+        key = int(p.get("yay0_offset", p.get("offset", 0)))
+        paints_by_yay0.setdefault(key, []).append(p)
     pairs: List[Dict[str, object]] = []
     for u in sorted(u16_records, key=lambda r: int(r["offset"])):
         uoff = int(u["offset"])
-        nxt = [p for p in paints_sorted if int(p.get("approx_offset", p.get("offset", 0))) >= uoff]
-        if nxt:
-            p = nxt[0]
+        local = paints_by_yay0.get(int(u.get("yay0_offset", uoff)), [])
+        picked: Optional[Dict[str, object]] = None
+        method = None
+        if local:
+            nxt = [p for p in local if int(p.get("approx_offset", p.get("offset", 0))) >= uoff]
+            if nxt:
+                picked = nxt[0]
+                method = "same_yay0_next"
+            else:
+                picked = min(local, key=lambda p: abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff))
+                method = "same_yay0_nearest"
+        if picked is None:
+            base = paints_good if paints_good else paints_sorted
+            nxt = [p for p in base if int(p.get("approx_offset", p.get("offset", 0))) >= uoff]
+            if nxt:
+                picked = nxt[0]
+                method = "global_next_filtered" if paints_good else "global_next"
+            elif base:
+                picked = min(base, key=lambda p: abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff))
+                method = "global_nearest_filtered" if paints_good else "global_nearest"
+        if picked is not None:
             pairs.append(
                 {
                     "u16_offset": uoff,
-                    "paint_offset": int(p.get("offset", 0)),
-                    "paint_subpart": p.get("subpart"),
+                    "paint_offset": int(picked.get("offset", 0)),
+                    "paint_subpart": picked.get("subpart"),
                     "light_be_png": u["light_be_png"],
                     "height_le_png": u["height_le_png"],
-                    "paint_png": p["paint_png"],
+                    "light_png": u.get("light_best_png", u["light_be_png"]),
+                    "height_png": u.get("height_best_png", u["height_le_png"]),
+                    "paint_png": picked["paint_png"],
+                    "paint_display_png": picked.get("paint_clean_square_png")
+                    or picked.get("paint_square_png")
+                    or picked.get("paint_clean_png")
+                    or picked["paint_png"],
+                    "pair_method": method,
+                    "pair_score": float(u.get("best_score", 0.0)) + float(picked.get("paint_score", 0.0)),
                 }
             )
 
@@ -2705,23 +4544,41 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
     nearest_pairs: List[Dict[str, object]] = []
     for u in sorted(u16_records, key=lambda r: int(r["offset"])):
         uoff = int(u["offset"])
-        if not paints_sorted:
+        local = paints_by_yay0.get(int(u.get("yay0_offset", uoff)), [])
+        ranked = []
+        method = "global_nearest"
+        if local:
+            ranked = sorted(
+                local,
+                key=lambda p: abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff),
+            )
+            method = "same_yay0_nearest"
+        elif paints_good or paints_sorted:
+            base = paints_good if paints_good else paints_sorted
+            ranked = sorted(
+                base,
+                key=lambda p: abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff),
+            )
+        if not ranked:
             break
-        ranked = sorted(
-            paints_sorted,
-            key=lambda p: abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff),
-        )
         top = ranked[:3]
         nearest_pairs.append(
             {
                 "u16_offset": uoff,
                 "light_be_png": u["light_be_png"],
                 "height_le_png": u["height_le_png"],
+                "light_png": u.get("light_best_png", u["light_be_png"]),
+                "height_png": u.get("height_best_png", u["height_le_png"]),
+                "pair_method": method,
                 "paint_candidates": [
                     {
                         "paint_offset": int(p.get("offset", 0)),
                         "paint_subpart": p.get("subpart"),
                         "paint_png": p["paint_png"],
+                        "paint_display_png": p.get("paint_clean_square_png")
+                        or p.get("paint_square_png")
+                        or p.get("paint_clean_png")
+                        or p["paint_png"],
                         "distance": abs(int(p.get("approx_offset", p.get("offset", 0))) - uoff),
                     }
                     for p in top
@@ -2785,6 +4642,269 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dump_textures_yay0(args: argparse.Namespace) -> int:
+    if Image is None:
+        raise RuntimeError("Pillow is required for PNG export: pip install pillow")
+    rom = pathlib.Path(args.rom).read_bytes()
+    out_dir = pathlib.Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    headers = find_yay0_headers(rom)
+    if args.limit:
+        headers = headers[: int(args.limit)]
+
+    all_entries: List[Dict[str, object]] = []
+    per_chunk: List[Dict[str, object]] = []
+
+    for i, off in enumerate(headers):
+        try:
+            dec, comp = yay0_decompress(rom, off)
+        except Exception as e:
+            per_chunk.append(
+                {
+                    "yay0_index": i,
+                    "yay0_offset": off,
+                    "error": str(e),
+                    "decompressed_size": None,
+                    "compressed_size_est": None,
+                    "textures": 0,
+                }
+            )
+            continue
+
+        chunk_label = f"y{i:04d}_{off:08X}"
+        model_out_dir = out_dir / "model_dl"
+        gen_out_dir = out_dir / "generic"
+        model_entries = _extract_textures_from_model_chunk(
+            data=dec,
+            chunk_label=chunk_label,
+            out_dir=model_out_dir,
+            min_tri_hits=max(1, int(args.min_tri_hits)),
+        )
+        generic_entries: List[Dict[str, object]] = []
+        if args.generic:
+            generic_entries = _extract_generic_texture_candidates(
+                data=dec,
+                chunk_label=chunk_label,
+                out_dir=gen_out_dir,
+                top_per_chunk=max(1, int(args.generic_top_per_chunk)),
+            )
+        entries = model_entries + generic_entries
+        all_entries.extend(entries)
+        per_chunk.append(
+            {
+                "yay0_index": i,
+                "yay0_offset": off,
+                "error": None,
+                "decompressed_size": len(dec),
+                "compressed_size_est": comp,
+                "textures": len(entries),
+                "model_dl_textures": len(model_entries),
+                "generic_textures": len(generic_entries),
+            }
+        )
+
+    # De-dup by raw PNG hash to collapse repeated tiny tiles.
+    by_hash: Dict[str, List[Dict[str, object]]] = {}
+    for e in all_entries:
+        p = pathlib.Path(str(e["png"]))
+        try:
+            h = hashlib.md5(p.read_bytes()).hexdigest()
+        except Exception:
+            continue
+        by_hash.setdefault(h, []).append(e)
+    unique_entries: List[Dict[str, object]] = []
+    for h, items in by_hash.items():
+        best = sorted(items, key=lambda x: float(x.get("score", 999.0)))[0]
+        unique_entries.append(
+            {
+                "png_md5": h,
+                "representative": best,
+                "ref_count": len(items),
+                "refs": [
+                    {
+                        "source": it.get("source"),
+                        "chunk": it.get("chunk"),
+                        "png": it.get("png"),
+                        "score": it.get("score"),
+                        "texture_state": it.get("texture_state"),
+                    }
+                    for it in items[:20]
+                ],
+            }
+        )
+    unique_entries.sort(key=lambda x: int(x.get("ref_count", 0)), reverse=True)
+
+    manifest = {
+        "rom": args.rom,
+        "yay0_processed": len(headers),
+        "counts": {
+            "textures_dumped": len(all_entries),
+            "unique_png_md5": len(unique_entries),
+            "model_dl": sum(1 for e in all_entries if e.get("source") == "model_dl"),
+            "generic": sum(1 for e in all_entries if str(e.get("source", "")).startswith("generic_")),
+        },
+        "chunks": per_chunk,
+        "entries": all_entries,
+        "unique": unique_entries,
+    }
+    out_manifest = out_dir / "manifest.json"
+    out_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "outdir": str(out_dir),
+                "manifest": str(out_manifest),
+                **manifest["counts"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_trace_seg4_context(args: argparse.Namespace) -> int:
+    rom = pathlib.Path(args.rom).read_bytes()
+    out_dir = pathlib.Path(args.outdir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    yoff = int(args.yay0_offset, 0)
+    model_off = int(args.model_offset, 0)
+    dl_off = int(args.dl_offset, 0) if args.dl_offset is not None else (model_off + 8)
+    tri_div2 = bool(not args.tri_raw)
+
+    dec, comp_len = yay0_decompress(rom, yoff)
+    v0, t0, s0, ts0, _uv0 = parse_model_with_texstates(dec, dl_off=dl_off, tri_div2=tri_div2)
+    local_score = _tri_state_decode_score(dec, ts0)
+    unresolved = _collect_unresolved_setimg_seg_offsets(dec, dl_off=dl_off, seg_id=0x04)
+    max_need = (max(unresolved) + int(args.pad_bytes)) if unresolved else 0
+
+    headers = find_yay0_headers(rom)
+    if args.limit:
+        headers = headers[: int(args.limit)]
+
+    ranked: List[Dict[str, object]] = []
+    for cand_off in headers:
+        cand_off = int(cand_off)
+        if cand_off == yoff:
+            continue
+        try:
+            cdec, ccomp = yay0_decompress(rom, cand_off)
+        except Exception:
+            continue
+        if max_need > 0 and len(cdec) < max_need:
+            continue
+
+        comp = dec + cdec
+        hint = {0x04: len(dec)}
+        try:
+            v2, t2, s2, ts2, _uv2 = parse_model_with_texstates(
+                comp,
+                dl_off=dl_off,
+                tri_div2=tri_div2,
+                seg_bases_init=hint,
+            )
+        except Exception:
+            continue
+        if len(v2) != len(v0) or len(t2) != len(t0):
+            continue
+        score = _tri_state_decode_score(comp, ts2)
+        ranked.append(
+            {
+                "cand_yay0_offset": cand_off,
+                "cand_yay0_hex": f"0x{cand_off:08X}",
+                "cand_decompressed_size": len(cdec),
+                "cand_compressed_size_est": int(ccomp),
+                "score": float(score),
+                "score_delta_vs_local": float(score - local_score),
+                "unresolved_setimg": int(s2.get("unresolved_setimg", -1)),
+                "texture_states": len({st for st in ts2 if st is not None}),
+            }
+        )
+    ranked.sort(key=lambda r: float(r.get("score", 1e9)))
+
+    previews: List[Dict[str, object]] = []
+    top_n = max(0, int(args.preview_top))
+    if top_n > 0 and Image is not None:
+        local_best = _best_texture_from_tri_states(dec, ts0)
+        if local_best is not None:
+            px, w, h = local_best
+            p = out_dir / "local_best_tex00.png"
+            _save_texture_png(p, px, w, h)
+            previews.append({"kind": "local", "png": str(p), "score": float(local_score)})
+        for i, r in enumerate(ranked[:top_n]):
+            c_off = int(r["cand_yay0_offset"])
+            try:
+                cdec, _ = yay0_decompress(rom, c_off)
+            except Exception:
+                continue
+            comp = dec + cdec
+            hint = {0x04: len(dec)}
+            try:
+                _v, _t, _s, ts2, _uv = parse_model_with_texstates(
+                    comp,
+                    dl_off=dl_off,
+                    tri_div2=tri_div2,
+                    seg_bases_init=hint,
+                )
+            except Exception:
+                continue
+            best = _best_texture_from_tri_states(comp, ts2)
+            if best is None:
+                continue
+            px, w, h = best
+            p = out_dir / f"cand_{i:02d}_{c_off:08X}_best_tex00.png"
+            _save_texture_png(p, px, w, h)
+            previews.append(
+                {
+                    "kind": "candidate",
+                    "rank": i,
+                    "cand_yay0_offset": c_off,
+                    "score": float(r["score"]),
+                    "png": str(p),
+                }
+            )
+
+    manifest = {
+        "rom": args.rom,
+        "target": {
+            "yay0_offset": yoff,
+            "yay0_hex": f"0x{yoff:08X}",
+            "model_offset": model_off,
+            "model_hex": f"0x{model_off:08X}",
+            "dl_offset": dl_off,
+            "tri_div2": bool(tri_div2),
+            "target_decompressed_size": len(dec),
+            "target_compressed_size_est": int(comp_len),
+            "local_score": float(local_score),
+            "local_unresolved_setimg": int(s0.get("unresolved_setimg", -1)),
+            "unresolved_seg4_offsets": unresolved,
+        },
+        "search": {
+            "candidates_considered": max(0, len(headers) - 1),
+            "candidates_ranked": len(ranked),
+            "pad_bytes": int(args.pad_bytes),
+        },
+        "top": ranked[: max(1, int(args.top))],
+        "all": ranked,
+        "previews": previews,
+    }
+    out_manifest = out_dir / "manifest.json"
+    out_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "outdir": str(out_dir),
+                "manifest": str(out_manifest),
+                "local_score": local_score,
+                "ranked": len(ranked),
+                "best_score": (ranked[0]["score"] if ranked else None),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Battlezone 64 extraction helper")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2822,6 +4942,7 @@ def build_parser() -> argparse.ArgumentParser:
     py.add_argument("--all-signatures", action="store_true", help="Export every model signature in each chunk (default: only root offsets 0x08/0x10)")
     py.add_argument("--strict-mesh", action="store_true", help="Apply stricter anti-spaghetti mesh filtering")
     py.add_argument("--standalone-only", action="store_true", help="Exclude models that reference non-local matrix/DL segments")
+    py.add_argument("--merge-chunk-models", action="store_true", help="Also write one merged OBJ/MTL per Yay0 chunk from exported signatures")
     py.set_defaults(func=cmd_batch_models_yay0)
 
     pz = sub.add_parser("extract-bzn", help="Extract decompressed .bzn chunks from Yay0 streams")
@@ -2883,12 +5004,59 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--end", help="Optional end ROM offset (hex or int)")
     pa.add_argument(
         "--u16-dims",
-        default="128x128",
-        help="Comma-separated u16 layout dimensions to evaluate for 32768-byte chunks",
+        default="128x128,256x256,512x512",
+        help="Comma-separated u16 layout dimensions to evaluate when size matches width*height*2",
+    )
+    pa.add_argument(
+        "--paint-dims",
+        default="128x128,64x256,256x64,32x512,512x32,256x256,512x512",
+        help="Comma-separated CI4 layout dimensions to evaluate for paint chunks",
     )
     pa.add_argument("--u16-variants-top", type=int, default=3, help="Number of best u16 variants to save per endianness (default: 3)")
     pa.add_argument("--paint-variants-top", type=int, default=3, help="Number of best paint decode variants to save per paint chunk (default: 3)")
+    pa.add_argument("--paint-denoise-passes", type=int, default=0, help="Optional paint cleanup passes (3x3 mode filter on CI4 indices)")
+    pa.add_argument("--paint-denoise-radius", type=int, default=1, help="Neighborhood radius for paint cleanup filter (default: 1)")
+    pa.add_argument(
+        "--prefer-light-variant",
+        action="append",
+        default=[],
+        help="Offset-specific regex preference for light variants, format OFFSET:REGEX (repeatable)",
+    )
+    pa.add_argument(
+        "--prefer-height-variant",
+        action="append",
+        default=[],
+        help="Offset-specific regex preference for height variants, format OFFSET:REGEX (repeatable)",
+    )
+    pa.add_argument(
+        "--prefer-paint-variant",
+        action="append",
+        default=[],
+        help="Offset-specific regex preference for paint variants, format OFFSET:REGEX (repeatable)",
+    )
     pa.set_defaults(func=cmd_terrain_all)
+
+    pd = sub.add_parser("dump-textures-yay0", help="Dump texture/sprite-like PNGs from Yay0 chunks")
+    pd.add_argument("--rom", required=True, help="Path to .z64 ROM")
+    pd.add_argument("--outdir", required=True, help="Output folder for dumped texture PNGs")
+    pd.add_argument("--limit", type=int, help="Optional max Yay0 chunks to process")
+    pd.add_argument("--min-tri-hits", type=int, default=2, help="Min triangle hits per model DL texture state (default: 2)")
+    pd.add_argument("--generic", action="store_true", help="Enable extra generic sprite/texture probing (noisier)")
+    pd.add_argument("--generic-top-per-chunk", type=int, default=8, help="Keep top-N generic candidates per chunk (default: 8)")
+    pd.set_defaults(func=cmd_dump_textures_yay0)
+
+    pc = sub.add_parser("trace-seg4-context", help="Trace external seg4 texture-context candidates for one model")
+    pc.add_argument("--rom", required=True, help="Path to .z64 ROM")
+    pc.add_argument("--outdir", required=True, help="Output folder for report/previews")
+    pc.add_argument("--yay0-offset", required=True, help="Target Yay0 offset (hex or int)")
+    pc.add_argument("--model-offset", required=True, help="Model signature offset in decompressed blob (hex or int)")
+    pc.add_argument("--dl-offset", help="Optional explicit DL offset (default: model_offset + 8)")
+    pc.add_argument("--tri-raw", action="store_true", help="Use raw TRI indices (default: div2)")
+    pc.add_argument("--pad-bytes", type=lambda x: int(x, 0), default=0x800, help="Required bytes beyond max unresolved seg4 offset (default: 0x800)")
+    pc.add_argument("--limit", type=int, help="Optional max Yay0 chunks to test")
+    pc.add_argument("--top", type=int, default=20, help="Top candidates kept in manifest (default: 20)")
+    pc.add_argument("--preview-top", type=int, default=6, help="Write best-texture previews for top-N candidates (default: 6)")
+    pc.set_defaults(func=cmd_trace_seg4_context)
 
     return p
 
