@@ -131,9 +131,33 @@ python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black D
   - nibble order (`hilo`/`lohi`)
   - row deinterleave (`rowxor1/2/4/8/16/32` on odd rows)
   - untile (linear + morton)
+- Paint dimension search now supports non-square layouts by default:
+  - `128x128,64x256,256x64,32x512,512x32,256x256,512x512`
 - Artifact scoring now penalizes checkerboard/parity noise and isolated-pixel noise.
 - Best variant exported as `paint_png` in manifests.
 - Top-N candidates are also saved for manual validation.
+- Optional paint cleanup is supported:
+  - `--paint-denoise-passes`
+  - `--paint-denoise-radius`
+- Offset-specific paint variant preference is supported:
+  - `--prefer-paint-variant OFFSET:REGEX`
+- Non-square paint outputs now also emit square display variants when possible:
+  - `paint_square_png`
+  - `paint_clean_square_png`
+- Pairing outputs now include overlay-ready paint path:
+  - `pairs[].paint_display_png`
+  - `nearest_pairs[].paint_candidates[].paint_display_png`
+
+### Validated Single-Best Terrain Example (2026-02-24)
+For `height/light @ 0x949B3C` and `paint @ 0x951BE4`:
+```powershell
+python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\terrain_probe_949B3C_951BE4_match_user --start 0x949B3C --end 0x951BE4 --u16-variants-top 2 --paint-variants-top 5 --paint-denoise-passes 1 --paint-denoise-radius 1 --prefer-paint-variant "0x951BE4:rowxor1_hilo_linear(_256x64)?$"
+```
+
+Validated best outputs:
+- Light: `extract_out/terrain_probe_949B3C_951BE4_match_user/00949B3C_be_linear_128x128.png`
+- Height: `extract_out/terrain_probe_949B3C_951BE4_match_user/00949B3C_height_best_le_linear_128x128.png`
+- Paint (display/overlay): `extract_out/terrain_probe_949B3C_951BE4_match_user/00951BE4_paint_clean_square_rowxor1_hilo_linear_256x64_r1_p1_128x128.png`
 
 ## Important Validations from Manual Review
 Confirmed examples:
@@ -159,6 +183,8 @@ Confirmed examples:
   - `nearest_pairs`
   - `unique_u16`
   - `unique_paint`
+- Pairing now prefers paint chunks from the same Yay0 container before falling back to global nearest matches.
+- Pair records include `pair_method` and `pair_score` for quick confidence sorting.
 
 Latest observed counts (from v2 full run):
 - `yay0_headers_in_range`: 639
@@ -190,13 +216,18 @@ Latest observed counts (from v2 full run):
   - `extract_out/models_romscan_v1/manifest.json` (`182` exported, `132` failed)
   - `extract_out/model_extraction_summary_v2.json` (combined run stats)
   - Note: `models_yay0_focus_v2` intentionally includes many low-tri/internal signatures and is not Blender-ready as-is.
+- Model manifests now include `mesh_confidence` and `texture_confidence` fields per export.
+- Model manifests now include `uv_out_of_range_ratio` and `textured_tri_ratio` for quick UV sanity checks.
 
 ## Model Texture Notes (Current)
 - CI4 texture decode now prefers palette/image pairs that are active during triangle draw commands in the executed DL stream.
 - Palette and image addresses are resolved from segmented pointers first, then low-24 local offsets as fallback.
 - Tile width/height is inferred from `G_SETTILESIZE` when available; fallback size candidates are tried if needed.
+- DL texture state tracking now includes load-vs-render tiles plus `G_LOADTLUT` / `G_LOADBLOCK` hints for better palette and size inference.
 - This improves color correctness versus fixed-offset extraction, especially where multiple `FD` texture loads exist in one model stream.
 - Current OBJ export still writes one material/PNG per mesh (dominant inferred tile). Many game models use multiple tiny tiled textures across sub-meshes, so full per-material texture reconstruction is still pending.
+- Material selection now weights triangle usage and visual scoring for better default texture choice.
+- UV scaling now uses `G_TEXTURE` when present; otherwise it falls back to the 4096 divisor.
 
 ## N64-Exclusive Map Focus
 Known high-priority extracted BZN containers:
