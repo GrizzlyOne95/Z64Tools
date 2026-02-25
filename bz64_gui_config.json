@@ -1,0 +1,109 @@
+{
+  "last_command": "batch-models-yay0",
+  "commands": {
+    "bzn-refs": {
+      "indir": "",
+      "out": ""
+    },
+    "decompress-stream": {
+      "indir": "",
+      "out": ""
+    },
+    "dump-textures-yay0": {
+      "rom": "",
+      "offset": "",
+      "type": "auto",
+      "out": ""
+    },
+    "height-candidates": {
+      "rom": "",
+      "outdir": "",
+      "limit": "",
+      "min_tri_hits": "2",
+      "generic": "False",
+      "generic_top_per_chunk": "8"
+    },
+    "rom-crc-verify": {
+      "rom": "",
+      "outdir": "",
+      "start": "0x928128",
+      "end": "0x97056A",
+      "width": "128",
+      "height": "128",
+      "size": "32768",
+      "keep_top": "4",
+      "valid_lightmap_offset": "[]",
+      "valid_light_be_offset": "[]",
+      "valid_height_le_offset": "[]"
+    },
+    "rom-info": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "cic": "6101"
+    },
+    "scan-containers": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "json": ""
+    },
+    "terrain-all": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "json": ""
+    },
+    "split-config": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "outdir": "",
+      "start": "",
+      "end": "",
+      "u16_dims": "128x128,256x256,512x512",
+      "paint_dims": "128x128,64x256,256x64,32x512,512x32,256x256,512x512",
+      "u16_variants_top": "3",
+      "paint_variants_top": "3",
+      "paint_denoise_passes": "0",
+      "paint_denoise_radius": "1",
+      "paint_no_behi64": "False",
+      "prefer_light_variant": "[]",
+      "prefer_height_variant": "[]",
+      "prefer_paint_variant": "[]"
+    },
+    "texture-decode-raw": {
+      "input": "",
+      "out": "",
+      "width": "",
+      "height": "",
+      "fmt": "",
+      "siz": "",
+      "tlut": ""
+    },
+    "audio-extract-wav": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "outdir": "C:/Users/istuart/Documents/GIT/Z64Tools/extract_out/audio",
+      "bank": "C217B0,C06F08;E05718,C22140",
+      "config_ini": "C:\\Users\\istuart\\Documents\\GIT\\N64SoundTools\\N64SoundListTool\\Release\\gameconfigsound.ini",
+      "game": "Battlezone - Rise of the Black Dogs (U)",
+      "sample_rate": "8000",
+      "half_sampling_rate": "False",
+      "limit": ""
+    },
+    "batch-models": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "outdir": "C:/Users/istuart/Documents/GIT/Z64Tools/extract_out/audio",
+      "bank": "C217B0,C06F08;E05718,C22140",
+      "config_ini": "C:\\Users\\istuart\\Documents\\GIT\\N64SoundTools\\N64SoundListTool\\Release\\gameconfigsound.ini",
+      "game": "Battlezone - Rise of the Black Dogs (U)",
+      "sample_rate": "8000",
+      "half_sampling_rate": "False",
+      "limit": ""
+    },
+    "batch-models-yay0": {
+      "rom": "C:/Users/istuart/Documents/GIT/Z64Tools/Battlezone - Rise of the Black Dogs (USA).z64",
+      "outdir": "C:/Users/istuart/Documents/GIT/Z64Tools/extract_out/models",
+      "limit": "",
+      "window": "24576",
+      "min_tris": "8",
+      "texture": "True",
+      "all_signatures": "True",
+      "strict_mesh": "True",
+      "standalone_only": "False",
+      "merge_chunk_models": "True"
+    }
+  }
+}

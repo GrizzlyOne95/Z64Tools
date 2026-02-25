@@ -1,7 +1,4 @@
-# Open Source WIP Battlezone64 ROM Extraction Tool
-
-<img width="1222" height="932" alt="image" src="https://github.com/user-attachments/assets/537bc20d-6f6d-4fbd-97b2-8d7ea5fadc13" />
-
+# Battlezone 64 Extraction Notes (Agent Handoff)
 
 This repository contains active reverse-engineering tooling and outputs for:
 - **Battlezone - Rise of the Black Dogs (N64)**
@@ -31,60 +28,90 @@ Working ROM path used during analysis:
 ## Tools / Commands
 All commands are run from repo root.
 
-### 1) Scan ROM for candidates
+### GUI Frontend (Battlezone-styled)
+```powershell
+python tools\bz64_gui.py
+```
+- Command dropdown includes all current `bz64_extract.py` subcommands.
+- All current flags/options are generated from argparse automatically.
+- ROM/file args include file picker buttons.
+- `--outdir` / `--indir` args include folder picker buttons.
+
+### 1) Import GLideN64 scene-rip (`.glr`) files
+```powershell
+python tools\bz64_extract.py import-scene-rip --input scene.glr --outdir extract_out\scene_one
+```
+
+### 1b) Batch import scene-rips + texture CRC index
+```powershell
+python tools\bz64_extract.py import-scene-rip-batch --indir glr_dumps --outdir extract_out\scene_rips --recursive
+```
+- Writes per-scene outputs (`scene.obj`, `triangles.csv`, `manifest.json`).
+- Writes batch manifests:
+  - `extract_out\scene_rips\manifest.json`
+  - `extract_out\scene_rips\texture_crc_manifest.json`
+
+### 2) Scan ROM for candidates
 ```powershell
 python tools\bz64_extract.py scan --rom "Battlezone - Rise of the Black Dogs (USA).z64"
 ```
 
-### 2) Export a known model blob
+### 3) Export a known model blob
 ```powershell
 python tools\bz64_extract.py export-model --input A1E6E4.bin --out extract_out\A1E6E4_tex --texture
 ```
 
-### 3) Batch models from Yay0 chunks
+### 4) Batch models from Yay0 chunks
 ```powershell
 python tools\bz64_extract.py batch-models-yay0 --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\models_yay0 --texture --all-signatures
 ```
 
-### 3b) Broad model recovery (low tri threshold)
+### 4b) Broad model recovery (low tri threshold)
 ```powershell
 python tools\bz64_extract.py batch-models-yay0 --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\models_yay0_focus_v2 --texture --all-signatures --min-tris 1
 ```
 
-### 3c) Blender-ready model recovery (recommended)
+### 4c) Blender-ready model recovery (recommended)
 ```powershell
 python tools\bz64_extract.py batch-models-yay0 --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\models_yay0_blender_v2 --texture --min-tris 24 --strict-mesh
 ```
 
-### 3d) Raw ROM signature extraction
+### 4d) Raw ROM signature extraction
 ```powershell
 python tools\bz64_extract.py batch-models --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\models_romscan_v1 --texture
 ```
 
-### 4) Extract `.bzn` chunks
+### 5) Extract `.bzn` chunks
 ```powershell
 python tools\bz64_extract.py extract-bzn --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\bzn
 ```
 
-### 5) Index stable BZN reference fields
+### 6) Index stable BZN reference fields
 ```powershell
 python tools\bz64_extract.py bzn-refs --indir extract_out\bzn --out extract_out\bzn_refs.json
 ```
 
-### 6) Terrain cluster extraction (focused range)
+### 7) Terrain cluster extraction (focused range)
 ```powershell
 python tools\bz64_extract.py terrain-cluster --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\terrain_cluster_92_97_plus --start 0x921994 --end 0x97056A
 ```
 
-### 7) Height candidate ranking (focused range)
+### 8) Height candidate ranking (focused range)
 ```powershell
 python tools\bz64_extract.py height-candidates --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\height_candidates_92_97_labeled --start 0x928128 --end 0x97056A --valid-light-be-offset 0x928128 --valid-light-be-offset 0x938B84 --valid-light-be-offset 0x95BDE4 --valid-light-be-offset 0x96CE6C --valid-height-le-offset 0x928128 --valid-height-le-offset 0x96CE6C
 ```
 
-### 8) Full-ROM terrain extraction (recommended)
+### 9) Full-ROM terrain extraction (recommended)
 ```powershell
 python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\terrain_all_tuned_v2 --u16-variants-top 2 --paint-variants-top 3
 ```
+
+### 10) Battlezone MIDI export (GE sequence -> `.mid`)
+```powershell
+python tools\bz64_extract.py audio-export-midi-bz64 --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\midi
+```
+- Uses Battlezone default sequence range (`0x00BE4118` to `0x00C054A8`).
+- Writes both `.bin` sequence chunks and converted `.mid` files plus `manifest_midi.json`.
 
 ## Implemented Format Knowledge
 
@@ -144,6 +171,7 @@ python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black D
   - `--paint-denoise-radius`
 - Offset-specific paint variant preference is supported:
   - `--prefer-paint-variant OFFSET:REGEX`
+- Legacy-adaptive BE-highbyte paint candidate is now included by default when size allows (disable with `--paint-no-behi64`).
 - Non-square paint outputs now also emit square display variants when possible:
   - `paint_square_png`
   - `paint_clean_square_png`
@@ -156,6 +184,12 @@ For `height/light @ 0x949B3C` and `paint @ 0x951BE4`:
 ```powershell
 python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\terrain_probe_949B3C_951BE4_match_user --start 0x949B3C --end 0x951BE4 --u16-variants-top 2 --paint-variants-top 5 --paint-denoise-passes 1 --paint-denoise-radius 1 --prefer-paint-variant "0x951BE4:rowxor1_hilo_linear(_256x64)?$"
 ```
+
+To force the legacy-adaptive style matching `tools/ADAPTIVE_64_asset_00951BE4.bin.png`:
+```powershell
+python tools\bz64_extract.py terrain-all --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\terrain_probe_949B3C_951BE4_adaptive64 --start 0x949B3C --end 0x951BE4 --u16-variants-top 2 --paint-variants-top 8
+```
+`0x951BE4` now defaults to `behi64_nearest` unless overridden with `--prefer-paint-variant`.
 
 Validated best outputs:
 - Light: `extract_out/terrain_probe_949B3C_951BE4_match_user/00949B3C_be_linear_128x128.png`
