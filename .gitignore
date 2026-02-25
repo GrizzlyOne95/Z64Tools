@@ -1,3 +1,4 @@
 *.z64
 *.Z64
 extract_out/
+*.json
