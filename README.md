@@ -7,6 +7,9 @@ This repository contains active reverse-engineering tooling and outputs for:
 - **Battlezone - Rise of the Black Dogs (N64)**
 - Goal: extract assets to modern, usable formats (OBJ/PNG/JSON)
 
+  <img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/f99bb4da-b77e-4021-af55-5d12b5025e0e" />
+
+
 Primary script:
 - `tools/bz64_extract.py`
 - Detailed model format notes:
