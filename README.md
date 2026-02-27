@@ -1,4 +1,7 @@
-# Battlezone 64 Extraction Notes (Agent Handoff)
+# Battlezone 64 Extraction Notes
+
+![f708c5b83e4d15cb367205a800a80d42](https://github.com/user-attachments/assets/404270a2-c5de-4fca-aaf6-d9868810bd03)
+
 
 This repository contains active reverse-engineering tooling and outputs for:
 - **Battlezone - Rise of the Black Dogs (N64)**
