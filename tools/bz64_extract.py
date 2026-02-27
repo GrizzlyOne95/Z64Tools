@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover
 
 
 MODEL_SIG = bytes.fromhex("D700000280008000")
+BZ64_DEFAULT_TERRAIN_RANGE = (0x928128, 0x97056A)
 
 
 @dataclasses.dataclass
@@ -207,6 +208,47 @@ def _iter_display_list_exec(
             break
 
         off += 8
+
+
+def _tri_cmd_indices_even(
+    data: bytes,
+    dl_off: int = 8,
+    seg_bases_init: Optional[Dict[int, int]] = None,
+    max_cmds: int = 200000,
+) -> Optional[bool]:
+    # Most Battlezone streams use F3DEX-style packed indices (idx*2), so
+    # triangle index bytes are all even when div2 decoding is correct.
+    seg_bases: Dict[int, int] = dict(seg_bases_init or {})
+    saw_tri = False
+    for _off, op, w0, w1 in _iter_display_list_exec(data, dl_off=dl_off, max_cmds=max_cmds, seg_bases=seg_bases):
+        if op == 0x05:  # TRI1
+            saw_tri = True
+            for v in (((w0 >> 16) & 0xFF), ((w0 >> 8) & 0xFF), (w0 & 0xFF)):
+                if (v & 1) != 0:
+                    return False
+            continue
+        if op == 0x06:  # TRI2
+            saw_tri = True
+            for v in (
+                ((w0 >> 16) & 0xFF),
+                ((w0 >> 8) & 0xFF),
+                (w0 & 0xFF),
+                ((w1 >> 16) & 0xFF),
+                ((w1 >> 8) & 0xFF),
+                (w1 & 0xFF),
+            ):
+                if (v & 1) != 0:
+                    return False
+            continue
+        if op == 0x07:  # QUAD
+            saw_tri = True
+            for v in (((w0 >> 16) & 0xFF), ((w0 >> 8) & 0xFF), (w0 & 0xFF), ((w1 >> 16) & 0xFF)):
+                if (v & 1) != 0:
+                    return False
+            continue
+    if not saw_tri:
+        return None
+    return True
 
 
 def _resolve_segment_offset(data: bytes, seg_addr: int, seg_bases: Optional[Dict[int, int]] = None) -> Optional[int]:
@@ -698,8 +740,6 @@ def parse_model_with_texstates(
         if state_img is None or current_fmt is None or current_siz is None:
             return None
         pal_bank = current_pal_bank
-        if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
-            pal_bank = 0
         return (
             -1 if pal is None else int(pal),
             int(state_img),
@@ -1533,15 +1573,21 @@ def _decode_texture_pixels_best_palbank(
     base_score = _decode_pick_score(base_pixels)
     base_a0_ratio = _alpha0_ratio(base_pixels)
 
-    # For CI4, resolve palette-bank ambiguity only when base decode looks
-    # clearly invalid. In this corpus, brute-force bank hopping can produce
-    # vivid but wrong textures; trust parsed pal_bank by default.
+    # For CI4, compare parsed pal_bank against safe fallbacks.
     if fmt == 2 and siz == 0 and pal_off is not None:
         base_invalid = base_score >= 1e8
+        probe_order: List[int] = [int(pal_bank)]
+        if int(pal_bank) != 0:
+            # Non-zero parsed banks are frequently valid, but in some streams
+            # the RAM pointer already references a bank-specific 16-color TLUT.
+            probe_order.append(0)
         if base_invalid or base_a0_ratio >= 0.85:
+            # Expanded search for clearly invalid / over-transparent results.
+            probe_order.extend(range(0, 16))
+        if len(probe_order) > 1:
             best: Tuple[float, List[Tuple[int, int, int, int]], int] = (base_score, base_pixels, int(pal_bank))
-            tried = {int(pal_bank)}
-            for bank in (0, int(pal_bank), 1, 2, 3, 4, 5, 6, 7):
+            tried: set[int] = set()
+            for bank in probe_order:
                 if bank in tried:
                     continue
                 tried.add(bank)
@@ -1553,7 +1599,11 @@ def _decode_texture_pixels_best_palbank(
                 if score < best[0]:
                     best = (score, pixels, int(bank))
             best_score, best_pixels, _best_bank = best
-            if (best_score + 0.20) < base_score or (base_a0_ratio >= 0.85 and (best_score + 0.08) < base_score):
+            if (
+                (best_score + 0.20) < base_score
+                or (base_a0_ratio >= 0.85 and (best_score + 0.08) < base_score)
+                or (int(pal_bank) != 0 and (best_score + 0.06) < base_score)
+            ):
                 base_score, base_pixels = best_score, best_pixels
 
     # CI4 state can be mislabeled in some streams; compare against I/IA variants.
@@ -1688,8 +1738,6 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
             if pal is None and current_fmt == 2 and last_tlut_candidate is not None:
                 pal = last_tlut_candidate
             pal_bank = current_pal_bank
-            if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
-                pal_bank = 0
             if pal is None or current_img is None:
                 # Non-CI formats may not require a palette.
                 if current_img is None:
@@ -2095,7 +2143,9 @@ def _extract_textures_from_model_chunk(
     out: List[Dict[str, object]] = []
     for mi, moff in enumerate(iter_model_headers(data)):
         dl_off = moff + 8
-        for tri_div2 in (True, False):
+        even_hint = _tri_cmd_indices_even(data, dl_off=dl_off)
+        tri_modes = (True,) if even_hint is True else (True, False)
+        for tri_div2 in tri_modes:
             try:
                 _v, _t, _s, tri_states, _uv = parse_model_with_texstates(data, dl_off=dl_off, tri_div2=tri_div2)
             except Exception:
@@ -2667,10 +2717,15 @@ def _export_one_model(
             dl_candidates.append(d)
 
         for d in dl_candidates:
-            for tri_div2 in (True, False):
+            even_hint = _tri_cmd_indices_even(chunk, dl_off=d)
+            if forced_tri_mode == "div2":
+                tri_mode_bools = (True,)
+            elif forced_tri_mode == "raw":
+                tri_mode_bools = (False,)
+            else:
+                tri_mode_bools = (True,) if even_hint is True else (True, False)
+            for tri_div2 in tri_mode_bools:
                 mode_name = "div2" if tri_div2 else "raw"
-                if forced_tri_mode is not None and mode_name != forced_tri_mode:
-                    continue
                 try:
                     v_try, t_try, s_try = parse_model(chunk, dl_off=d, tri_div2=tri_div2)
                 except Exception:
@@ -5018,8 +5073,14 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
         raise RuntimeError("Pillow is required for terrain PNG export: pip install pillow")
 
     headers = find_yay0_headers(rom)
-    start = int(args.start, 0) if args.start is not None else 0
-    end = int(args.end, 0) if args.end is not None else (len(rom) - 1)
+    start = int(args.start, 0) if args.start is not None else BZ64_DEFAULT_TERRAIN_RANGE[0]
+    end = int(args.end, 0) if args.end is not None else BZ64_DEFAULT_TERRAIN_RANGE[1]
+    if start < 0:
+        start = 0
+    if end >= len(rom):
+        end = len(rom) - 1
+    if end < start:
+        raise ValueError("Invalid terrain range: --end must be greater than or equal to --start")
     headers = [o for o in headers if start <= o <= end]
 
     u16_records: List[Dict[str, object]] = []
@@ -5813,6 +5874,21 @@ def _parse_scan_nums(spec: str) -> List[int]:
     return vals
 
 
+_SEED_HEX_RE = re.compile(r"(?i)(?<![0-9A-Fa-f])(?:0x)?([0-9A-Fa-f]{6,8})(?![0-9A-Fa-f])")
+
+
+def _dedupe_ints_keep_order(vals: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    seen: set[int] = set()
+    for v in vals:
+        iv = int(v)
+        if iv in seen:
+            continue
+        seen.add(iv)
+        out.append(iv)
+    return out
+
+
 def _parse_offset_seed_list(items: Sequence[str]) -> List[int]:
     offs: List[int] = []
     for raw in items:
@@ -5820,8 +5896,22 @@ def _parse_offset_seed_list(items: Sequence[str]) -> List[int]:
             t = tok.strip()
             if not t:
                 continue
-            # Accept forms like AD73FE_2 by taking the leading numeric token.
-            m = re.match(r"^[+-]?(?:0x)?[0-9A-Fa-f]+", t)
+            matched_hex = False
+            # Accept embedded offset forms like:
+            # - AD73FE_2
+            # - y0283_009FA696_m00_000038
+            # - C:\path\AB1FAC.png
+            for m in _SEED_HEX_RE.finditer(t):
+                n = m.group(1)
+                try:
+                    offs.append(int(n, 16))
+                    matched_hex = True
+                except Exception:
+                    continue
+            if matched_hex:
+                continue
+            # Fallback: accept only explicit decimal or 0x-prefixed tokens.
+            m = re.match(r"^[+-]?(?:0x[0-9A-Fa-f]+|\d+)$", t)
             if not m:
                 continue
             n = m.group(0)
@@ -5829,14 +5919,45 @@ def _parse_offset_seed_list(items: Sequence[str]) -> List[int]:
                 offs.append(int(_parse_num_auto(n)))
             except Exception:
                 continue
-    out: List[int] = []
-    seen: set[int] = set()
-    for o in offs:
-        if o in seen:
+    return _dedupe_ints_keep_order(offs)
+
+
+def _parse_offset_seed_files(paths: Sequence[str]) -> List[int]:
+    offs: List[int] = []
+    for raw in paths:
+        p = pathlib.Path(str(raw)).expanduser()
+        if not p.exists() or not p.is_file():
             continue
-        seen.add(o)
-        out.append(o)
-    return out
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            offs.extend(_parse_offset_seed_list(text.splitlines()))
+        except Exception:
+            # Best-effort fallback: parse filename/path token only.
+            offs.extend(_parse_offset_seed_list([p.name, str(p)]))
+    return _dedupe_ints_keep_order(offs)
+
+
+def _parse_offset_seed_dirs(paths: Sequence[str]) -> List[int]:
+    offs: List[int] = []
+    for raw in paths:
+        root = pathlib.Path(str(raw)).expanduser()
+        if not root.exists():
+            continue
+        if root.is_file():
+            offs.extend(_parse_offset_seed_list([root.name]))
+            continue
+        offs.extend(_parse_offset_seed_list([root.name]))
+        try:
+            it = root.rglob("*")
+            for ent in it:
+                try:
+                    rel = str(ent.relative_to(root))
+                except Exception:
+                    rel = ent.name
+                offs.extend(_parse_offset_seed_list([ent.name, rel]))
+        except Exception:
+            continue
+    return _dedupe_ints_keep_order(offs)
 
 
 def _pal16_likely(data: bytes, pal_off: int, min_unique: int = 6) -> bool:
@@ -5961,7 +6082,16 @@ def _scan_texture_best_at(
                 continue
             s = float(_texture_visual_score(pixels, int(w), int(h)))
             if s > max_score:
-                continue
+                # Rescue plausible CI8 hits that sit slightly above threshold.
+                # This avoids dropping known-good offsets during strict scans.
+                rescue_ok = False
+                if int(fmt) == 2 and int(siz) == 1 and s <= (max_score + 0.55):
+                    npx = max(1, len(pixels))
+                    uniq_ratio = len(set(pixels)) / float(npx)
+                    a0_ratio = sum(1 for px in pixels if px[3] == 0) / float(npx)
+                    rescue_ok = (0.05 <= uniq_ratio <= 0.80) and (a0_ratio <= 0.80)
+                if not rescue_ok:
+                    continue
             if s < best_score:
                 best_score = s
                 best = {
@@ -6083,9 +6213,17 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
             if len(coarse_seed_offsets) >= coarse_keep:
                 break
 
-    # 2) Explicit seeds from user hints (including tokens like AD73FE_2).
+    # 2) Explicit and reference-derived seeds.
     seed_offsets_raw = _parse_offset_seed_list(args.seed_offset or [])
-    seed_offsets = [o for o in seed_offsets_raw if start <= o <= end]
+    seed_offsets_from_files_raw = _parse_offset_seed_files(args.seed_offset_file or [])
+    seed_offsets_from_dirs_raw = _parse_offset_seed_dirs(args.seed_from_dir or [])
+    seed_offsets_combined = _dedupe_ints_keep_order(
+        list(seed_offsets_raw) + list(seed_offsets_from_files_raw) + list(seed_offsets_from_dirs_raw)
+    )
+    seed_offsets = [o for o in seed_offsets_combined if start <= o <= end]
+    seed_offsets_from_user = [o for o in seed_offsets_raw if start <= o <= end]
+    seed_offsets_from_files = [o for o in seed_offsets_from_files_raw if start <= o <= end]
+    seed_offsets_from_dirs = [o for o in seed_offsets_from_dirs_raw if start <= o <= end]
 
     # 3) Fine scan offsets: around coarse seeds + explicit seeds.
     fine_offsets: set[int] = set()
@@ -6199,12 +6337,17 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
             "coarse_keep": int(coarse_keep),
             "coarse_dedupe_radius": int(coarse_dedupe_radius),
             "keep": int(keep_n),
+            "seed_offset_files": [str(x) for x in (args.seed_offset_file or [])],
+            "seed_from_dir": [str(x) for x in (args.seed_from_dir or [])],
         },
         "counts": {
             "coarse_offsets_scanned": int(coarse_offsets_total),
             "coarse_hits": len(coarse_hits),
             "coarse_seed_offsets": len(coarse_seed_offsets),
-            "seed_offsets_from_user": len(seed_offsets),
+            "seed_offsets_from_user": len(seed_offsets_from_user),
+            "seed_offsets_from_files": len(seed_offsets_from_files),
+            "seed_offsets_from_dirs": len(seed_offsets_from_dirs),
+            "seed_offsets_total": len(seed_offsets),
             "fine_offsets_scanned": int(fine_scanned),
             "accepted_fine_hits": int(accepted),
             "unique_png_md5": len(unique_rows),
@@ -8819,8 +8962,16 @@ def build_parser() -> argparse.ArgumentParser:
     pa = sub.add_parser("terrain-all", help="Full ROM terrain-like extraction (u16 layers + CI4 paints)")
     pa.add_argument("--rom", required=True, help="Path to .z64 ROM")
     pa.add_argument("--outdir", required=True, help="Output folder for exported terrain images and manifest")
-    pa.add_argument("--start", help="Optional start ROM offset (hex or int)")
-    pa.add_argument("--end", help="Optional end ROM offset (hex or int)")
+    pa.add_argument(
+        "--start",
+        default=f"0x{BZ64_DEFAULT_TERRAIN_RANGE[0]:08X}",
+        help=f"Start ROM offset (hex or int, default: 0x{BZ64_DEFAULT_TERRAIN_RANGE[0]:08X})",
+    )
+    pa.add_argument(
+        "--end",
+        default=f"0x{BZ64_DEFAULT_TERRAIN_RANGE[1]:08X}",
+        help=f"End ROM offset (hex or int, default: 0x{BZ64_DEFAULT_TERRAIN_RANGE[1]:08X})",
+    )
     pa.add_argument(
         "--u16-dims",
         default="128x128,256x256,512x512",
@@ -8888,6 +9039,18 @@ def build_parser() -> argparse.ArgumentParser:
     psr2.add_argument("--coarse-keep", type=int, default=256, help="Maximum coarse seed offsets kept for refine pass (0 disables coarse seeds)")
     psr2.add_argument("--coarse-dedupe-radius", default="0x80", help="Deduplicate coarse seeds within this byte radius (default: 0x80)")
     psr2.add_argument("--seed-offset", action="append", default=[], help="Extra offset hints to refine (hex/int tokens; supports forms like AD73FE_2)")
+    psr2.add_argument(
+        "--seed-offset-file",
+        action="append",
+        default=[],
+        help="Text file with seed offset tokens (hex/int); repeatable",
+    )
+    psr2.add_argument(
+        "--seed-from-dir",
+        action="append",
+        default=[],
+        help="Directory to mine offset-like hex tokens from file/folder names; repeatable",
+    )
     psr2.add_argument("--keep", type=int, default=512, help="Max unique PNG candidates written (default: 512)")
     psr2.add_argument("--ci-only", action="store_true", help="Only evaluate CI4/CI8 recipes (skip I/IA/RGBA probes)")
     psr2.set_defaults(func=cmd_scan_textures_rom)
