@@ -88,11 +88,36 @@ python tools\bz64_extract.py batch-models --rom "Battlezone - Rise of the Black 
 ```powershell
 python tools\bz64_extract.py extract-bzn --rom "Battlezone - Rise of the Black Dogs (USA).z64" --outdir extract_out\bzn
 ```
+- Extraction now recognizes both:
+  - name-tagged containers (embedded `*.bzn` string), and
+  - structurally valid N64 BZN containers even when the terrain token omits `.bzn` (e.g. `misn04`, `race02`, `multst01`).
+
+### 5b) Merge extracted BZN sets into your working folder
+```powershell
+python tools\bz64_extract.py bzn-merge --srcdir extract_out\bzn_audit_20260305\extract_bzn_patched --dstdir bzn --only-detection-method structural --out extract_out\bzn_audit_20260305\bzn_merge_report.json
+```
+- Merges by ROM offset from filename/manifest metadata.
+- Default conflict mode is safe (`--on-conflict keep`).
 
 ### 6) Index stable BZN reference fields
 ```powershell
 python tools\bz64_extract.py bzn-refs --indir extract_out\bzn --out extract_out\bzn_refs.json
 ```
+
+### 6b) Dump N64 BZN entity preambles (native parser)
+```powershell
+python tools\bz64_extract.py bzn64-entity-dump --indir extract_out\bzn --out extract_out\bzn64_entity_dump.json --focus-priority-set
+```
+- Parses N64 binary token streams (`u16 size + payload + odd-size pad`) and emits per-entity records:
+  - `prjid_id/prjid`
+  - `seqno`
+  - `pos`
+  - `team`
+  - `label_id`
+  - `is_user`
+  - `obj_addr`
+  - `transform_old`
+- Auto-loads `BZN64_Enum_PrjID.txt` and `BZ1_ClassLabels.txt` if present (override via `--prjid-enum` / `--class-labels`).
 
 ### 7) Terrain cluster extraction (focused range)
 ```powershell

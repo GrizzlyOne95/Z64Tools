@@ -18,6 +18,7 @@ from collections import Counter, defaultdict
 import dataclasses
 import csv
 import fnmatch
+import itertools
 import math
 import json
 import hashlib
@@ -41,7 +42,6 @@ except Exception:  # pragma: no cover
 
 
 MODEL_SIG = bytes.fromhex("D700000280008000")
-BZ64_DEFAULT_TERRAIN_RANGE = (0x928128, 0x97056A)
 
 
 @dataclasses.dataclass
@@ -740,6 +740,10 @@ def parse_model_with_texstates(
         if state_img is None or current_fmt is None or current_siz is None:
             return None
         pal_bank = current_pal_bank
+        if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
+            # 16-entry TLUT loads already identify the active palette explicitly.
+            # Applying render-tile pal_bank again can misindex into unrelated data.
+            pal_bank = 0
         return (
             -1 if pal is None else int(pal),
             int(state_img),
@@ -1609,10 +1613,10 @@ def _decode_texture_pixels_best_palbank(
     # CI4 state can be mislabeled in some streams; compare against I/IA variants.
     # Keep CI4 unless an alternate decode is clearly better.
     if fmt == 2 and siz == 0:
-        # When a CI palette pointer is present and the decode is reasonably
-        # opaque, prefer CI4. Aggressive IA/I fallback causes grayscale/alpha
-        # artifacts on valid paletted models in this corpus.
-        allow_alt_fmt = (pal_off is None) or (base_a0_ratio >= 0.65) or (base_score >= 3.0)
+        # When a CI palette pointer is present, favor CI4 strongly. Aggressive
+        # IA/I fallback causes grayscale/alpha artifacts on valid paletted
+        # models. Only permit fallback for clearly catastrophic CI4 decodes.
+        allow_alt_fmt = (pal_off is None) or (base_score >= 3.6 and base_a0_ratio >= 0.92)
         if allow_alt_fmt:
             alt_best: Optional[Tuple[float, List[Tuple[int, int, int, int]]]] = None
             for alt_fmt, alt_siz in ((4, 1), (3, 1), (4, 0), (3, 0)):
@@ -1629,7 +1633,10 @@ def _decode_texture_pixels_best_palbank(
                 alt_score, alt_pixels = alt_best
                 # Make fallback to I/IA strict; only use it when CI4 decode is
                 # clearly implausible or substantially worse.
-                if (alt_score + 0.30) < base_score or (base_a0_ratio >= 0.70 and (alt_score + 0.08) < base_score):
+                if (
+                    (alt_score + 0.45) < base_score
+                    or (base_score >= 4.0 and (alt_score + 0.18) < base_score)
+                ):
                     return alt_pixels
 
     return base_pixels
@@ -1738,6 +1745,8 @@ def extract_ci4_texture_from_dl(data: bytes, dl_off: int) -> Tuple[List[Tuple[in
             if pal is None and current_fmt == 2 and last_tlut_candidate is not None:
                 pal = last_tlut_candidate
             pal_bank = current_pal_bank
+            if current_fmt == 2 and current_siz == 0 and current_tlut_entries is not None and current_tlut_entries <= 16:
+                pal_bank = 0
             if pal is None or current_img is None:
                 # Non-CI formats may not require a palette.
                 if current_img is None:
@@ -3128,20 +3137,74 @@ def cmd_extract_bzn(args: argparse.Namespace) -> int:
     entries: List[Dict[str, object]] = []
     seen_names: Dict[str, int] = {}
     pat = re.compile(rb"([A-Za-z0-9_\-]{3,24}\.bzn)", re.IGNORECASE)
+    enum_path = _pick_existing_path(
+        [
+            "BZN64_Enum_PrjID.txt",
+            ".tmp_BZNTools/BZNParser/BZN64_Enum_PrjID.txt",
+        ]
+    )
+    known_prjid_ids = set(_load_bzn64_prjid_enum(str(enum_path) if enum_path is not None else None).keys())
 
     for off in find_yay0_headers(rom):
         try:
             dec, comp_len = yay0_decompress(rom, off)
         except Exception:
             continue
+        raw_name = ""
+        stem = ""
+        name_offset: Optional[int] = None
+        detection_method = "name_regex"
+        entity_count_declared: Optional[int] = None
+        entity_count_parsed: Optional[int] = None
+        terrain_name: Optional[str] = None
+        entity_parse_mode: Optional[str] = None
+
         m = pat.search(dec[:128])
-        if not m:
+        if m:
+            raw_name = m.group(1).decode("ascii", errors="ignore")
+            stem = raw_name[:-4]
+            name_offset = int(m.start())
+            terrain_name = raw_name
+        else:
+            tokens, tok_err = _bzn64_read_tokens(dec)
+            if tok_err or len(tokens) < 4:
+                continue
+            if [tokens[i].size for i in range(4)] != [4, 1, 100, 4]:
+                continue
+            try:
+                entity_count = int(_bzn64_u32(tokens[3]))
+                starts, _cands, mode = _bzn64_pick_entity_starts(
+                    tokens=tokens,
+                    start_idx=4,
+                    entity_count=entity_count,
+                    known_prjid_ids=known_prjid_ids,
+                    team_max=16,
+                )
+            except Exception:
+                continue
+            if len(starts) != int(entity_count):
+                continue
+            tname = _bzn64_ascii_cstr(tokens[2]).strip()
+            if not tname:
+                tname = "unnamed"
+            if tname.lower().endswith(".bzn"):
+                tname = tname[:-4]
+            safe = re.sub(r"[^A-Za-z0-9_\-]", "_", tname).strip("_")
+            if not safe:
+                safe = "unnamed"
+            stem = safe[:24]
+            raw_name = f"{stem}.bzn"
+            terrain_name = tname
+            detection_method = "structural"
+            entity_count_declared = int(entity_count)
+            entity_count_parsed = int(len(starts))
+            entity_parse_mode = str(mode)
+
+        if not raw_name or not stem:
             continue
-        raw_name = m.group(1).decode("ascii", errors="ignore")
         norm = raw_name.lower()
         suffix = seen_names.get(norm, 0)
         seen_names[norm] = suffix + 1
-        stem = raw_name[:-4]
         if suffix:
             out_name = f"{stem}__{off:08X}__{suffix}.bzn"
         else:
@@ -3155,7 +3218,12 @@ def cmd_extract_bzn(args: argparse.Namespace) -> int:
                 "rom_offset": off,
                 "decompressed_size": len(dec),
                 "compressed_size_est": comp_len,
-                "name_offset": int(m.start()),
+                "name_offset": name_offset,
+                "detection_method": detection_method,
+                "terrain_name": terrain_name,
+                "entity_count_declared": entity_count_declared,
+                "entity_count_parsed": entity_count_parsed,
+                "entity_parse_mode": entity_parse_mode,
                 "output": str(out_path),
             }
         )
@@ -3168,6 +3236,196 @@ def cmd_extract_bzn(args: argparse.Namespace) -> int:
     out_manifest = out_dir / "manifest.json"
     out_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps({"outdir": str(out_dir), "manifest": str(out_manifest), "count": len(entries)}, indent=2))
+    return 0
+
+
+def _bzn_offset_from_name(name: str) -> Optional[int]:
+    m = re.search(r"__([0-9A-Fa-f]{8})(?:__\d+)?\.bzn$", str(name), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1), 16)
+    except Exception:
+        return None
+
+
+def _sha1_path(path: pathlib.Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def _pick_nonconflicting_bzn_name(dst_dir: pathlib.Path, stem: str, off: int) -> pathlib.Path:
+    base = re.sub(r"[^A-Za-z0-9_\-]", "_", str(stem).strip())
+    if not base:
+        base = "unnamed"
+    p0 = dst_dir / f"{base}__{int(off):08X}.bzn"
+    if not p0.exists():
+        return p0
+    i = 1
+    while True:
+        p = dst_dir / f"{base}__{int(off):08X}__{i}.bzn"
+        if not p.exists():
+            return p
+        i += 1
+
+
+def cmd_bzn_merge(args: argparse.Namespace) -> int:
+    src_dir = pathlib.Path(args.srcdir)
+    dst_dir = pathlib.Path(args.dstdir)
+    if not src_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {src_dir}")
+    if not dst_dir.exists():
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+    only_method = str(getattr(args, "only_detection_method", "") or "").strip().lower()
+    if only_method in {"", "all"}:
+        only_method = ""
+
+    # Optional manifest-driven input for richer filtering.
+    manifest_path_raw = str(getattr(args, "manifest", "") or "").strip()
+    manifest_path = pathlib.Path(manifest_path_raw) if manifest_path_raw else (src_dir / "manifest.json")
+    source_items: List[Dict[str, object]] = []
+    if manifest_path.exists():
+        try:
+            man = json.loads(manifest_path.read_text(encoding="utf-8"))
+            entries = cast(List[Dict[str, object]], man.get("entries", []))
+            for e in entries:
+                meth = str(e.get("detection_method", "")).strip().lower()
+                if only_method and meth != only_method:
+                    continue
+                out_raw = str(e.get("output", "") or "").strip()
+                if not out_raw:
+                    continue
+                p = pathlib.Path(out_raw)
+                if not p.is_absolute():
+                    p = src_dir / p.name
+                if not p.exists():
+                    # Fallback: try basename under src_dir.
+                    p = src_dir / pathlib.Path(out_raw).name
+                if not p.exists():
+                    continue
+                off_obj = e.get("rom_offset")
+                off: Optional[int]
+                if off_obj is None:
+                    off = _bzn_offset_from_name(p.name)
+                else:
+                    off = int(off_obj)
+                source_items.append(
+                    {
+                        "path": p,
+                        "offset": off,
+                        "name": str(e.get("name", "") or p.name),
+                        "detection_method": meth if meth else None,
+                    }
+                )
+        except Exception:
+            source_items = []
+
+    if not source_items:
+        for p in sorted(src_dir.glob("*.bzn")):
+            off = _bzn_offset_from_name(p.name)
+            source_items.append({"path": p, "offset": off, "name": p.name, "detection_method": None})
+
+    dst_by_off: Dict[int, List[pathlib.Path]] = defaultdict(list)
+    for p in sorted(dst_dir.glob("*.bzn")):
+        off = _bzn_offset_from_name(p.name)
+        if off is not None:
+            dst_by_off[int(off)].append(p)
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    on_conflict = str(getattr(args, "on_conflict", "keep")).strip().lower()
+    if on_conflict not in {"keep", "copy", "replace"}:
+        on_conflict = "keep"
+
+    added: List[Dict[str, object]] = []
+    skipped_same: List[Dict[str, object]] = []
+    skipped_conflict: List[Dict[str, object]] = []
+    skipped_no_offset: List[str] = []
+    replaced: List[Dict[str, object]] = []
+
+    for item in source_items:
+        sp = cast(pathlib.Path, item["path"])
+        off = cast(Optional[int], item["offset"])
+        if off is None:
+            skipped_no_offset.append(str(sp))
+            continue
+
+        existing = list(dst_by_off.get(int(off), []))
+        src_sha = _sha1_path(sp)
+        same = [p for p in existing if _sha1_path(p) == src_sha]
+        if same:
+            skipped_same.append({"offset": int(off), "src": str(sp), "existing": [str(x) for x in same]})
+            continue
+
+        src_stem = sp.stem.split("__", 1)[0]
+        if not existing:
+            out_path = _pick_nonconflicting_bzn_name(dst_dir, src_stem, int(off))
+            if not dry_run:
+                out_path.write_bytes(sp.read_bytes())
+            dst_by_off[int(off)].append(out_path)
+            added.append({"offset": int(off), "src": str(sp), "dst": str(out_path)})
+            continue
+
+        # offset exists but content differs.
+        if on_conflict == "keep":
+            skipped_conflict.append({"offset": int(off), "src": str(sp), "existing": [str(x) for x in existing]})
+            continue
+        if on_conflict == "replace":
+            out_path = existing[0]
+            if not dry_run:
+                out_path.write_bytes(sp.read_bytes())
+            replaced.append({"offset": int(off), "src": str(sp), "dst": str(out_path)})
+            continue
+        # on_conflict == copy
+        out_path = _pick_nonconflicting_bzn_name(dst_dir, src_stem, int(off))
+        if not dry_run:
+            out_path.write_bytes(sp.read_bytes())
+        dst_by_off[int(off)].append(out_path)
+        added.append({"offset": int(off), "src": str(sp), "dst": str(out_path)})
+
+    summary = {
+        "src_dir": str(src_dir),
+        "dst_dir": str(dst_dir),
+        "manifest_used": str(manifest_path) if manifest_path.exists() else None,
+        "only_detection_method": (only_method if only_method else None),
+        "on_conflict": on_conflict,
+        "dry_run": dry_run,
+        "source_items": len(source_items),
+        "added": len(added),
+        "replaced": len(replaced),
+        "skipped_same": len(skipped_same),
+        "skipped_conflict": len(skipped_conflict),
+        "skipped_no_offset": len(skipped_no_offset),
+    }
+    out_obj = {
+        "summary": summary,
+        "added": added,
+        "replaced": replaced,
+        "skipped_same": skipped_same,
+        "skipped_conflict": skipped_conflict,
+        "skipped_no_offset": skipped_no_offset,
+    }
+
+    out_path_raw = str(getattr(args, "out", "") or "").strip()
+    if out_path_raw:
+        out_path = pathlib.Path(out_path_raw)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(out_obj, indent=2), encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "src_dir": str(src_dir),
+                "dst_dir": str(dst_dir),
+                "added": len(added),
+                "replaced": len(replaced),
+                "skipped_same": len(skipped_same),
+                "skipped_conflict": len(skipped_conflict),
+                "skipped_no_offset": len(skipped_no_offset),
+                "dry_run": dry_run,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -3224,6 +3482,419 @@ def cmd_bzn_refs(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
     print(json.dumps({"out": str(out_path), "count": len(records), "groups": len(groups)}, indent=2))
+    return 0
+
+
+@dataclasses.dataclass
+class Bzn64Token:
+    idx: int
+    offset: int
+    size: int
+    payload: bytes
+    pad: Optional[int]
+
+
+def _bzn64_read_tokens(data: bytes) -> Tuple[List[Bzn64Token], Optional[str]]:
+    out: List[Bzn64Token] = []
+    off = 0
+    n = len(data)
+    idx = 0
+    while off + 2 <= n:
+        hdr = off
+        sz = int(struct.unpack_from(">H", data, off)[0])
+        off += 2
+        if off + sz > n:
+            return out, f"truncated token payload at 0x{hdr:X} (size={sz})"
+        payload = data[off : off + sz]
+        off += sz
+        pad: Optional[int] = None
+        if sz & 1:
+            if off >= n:
+                return out, f"missing odd-size pad byte at 0x{hdr:X}"
+            pad = int(data[off])
+            off += 1
+        out.append(Bzn64Token(idx=idx, offset=hdr, size=sz, payload=payload, pad=pad))
+        idx += 1
+    if off != n:
+        return out, f"unexpected trailing bytes ({n - off})"
+    return out, None
+
+
+def _bzn64_u16(tok: Bzn64Token) -> int:
+    if tok.size < 2:
+        raise ValueError(f"token {tok.idx} too small for u16")
+    return int(struct.unpack_from(">H", tok.payload, 0)[0])
+
+
+def _bzn64_u32(tok: Bzn64Token) -> int:
+    if tok.size < 4:
+        raise ValueError(f"token {tok.idx} too small for u32")
+    return int(struct.unpack_from(">I", tok.payload, 0)[0])
+
+
+def _bzn64_f32_vec(tok: Bzn64Token, count: int) -> List[float]:
+    need = int(count) * 4
+    if tok.size < need:
+        raise ValueError(f"token {tok.idx} too small for {count} f32 values")
+    return [float(struct.unpack_from(">f", tok.payload, i * 4)[0]) for i in range(int(count))]
+
+
+def _bzn64_ascii_cstr(tok: Bzn64Token) -> str:
+    return tok.payload.split(b"\x00", 1)[0].decode("ascii", errors="ignore")
+
+
+def _pick_existing_path(candidates: Sequence[str]) -> Optional[pathlib.Path]:
+    for raw in candidates:
+        p = pathlib.Path(str(raw))
+        if p.exists():
+            return p
+    return None
+
+
+def _load_bzn64_prjid_enum(path: Optional[str]) -> Dict[int, str]:
+    if not path:
+        return {}
+    p = pathlib.Path(path)
+    if not p.exists():
+        return {}
+    out: Dict[int, str] = {}
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        ln = str(line).strip()
+        if not ln:
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 2:
+            continue
+        key = parts[0].strip()
+        val = parts[1].strip()
+        if not key:
+            continue
+        try:
+            k = int(key, 0)
+        except Exception:
+            continue
+        if val:
+            out[int(k)] = val
+    return out
+
+
+def _load_bz1_class_labels(path: Optional[str]) -> Dict[str, List[str]]:
+    if not path:
+        return {}
+    p = pathlib.Path(path)
+    if not p.exists():
+        return {}
+    acc: Dict[str, set[str]] = defaultdict(set)
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        ln = str(line).strip()
+        if not ln:
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 2:
+            continue
+        prjid = parts[0].strip().lower()
+        cls = parts[1].strip().lower()
+        if not prjid or not cls:
+            continue
+        acc[prjid].add(cls)
+    out: Dict[str, List[str]] = {}
+    for k, v in acc.items():
+        out[k] = sorted(v)
+    return out
+
+
+def _bzn64_is_candidate_entity_start(
+    tokens: Sequence[Bzn64Token],
+    i: int,
+    known_prjid_ids: Optional[set[int]] = None,
+    team_max: int = 16,
+) -> bool:
+    if i < 0 or (i + 7) >= len(tokens):
+        return False
+    if [tokens[i + k].size for k in range(8)] != [2, 2, 12, 4, 2, 4, 4, 48]:
+        return False
+    try:
+        prjid = _bzn64_u16(tokens[i + 0])
+        team = _bzn64_u32(tokens[i + 3])
+        is_user = _bzn64_u32(tokens[i + 5])
+        obj_addr = _bzn64_u32(tokens[i + 6])
+        pos = _bzn64_f32_vec(tokens[i + 2], 3)
+        m = _bzn64_f32_vec(tokens[i + 7], 12)
+    except Exception:
+        return False
+    if known_prjid_ids and prjid not in known_prjid_ids:
+        return False
+    if team < 0 or team > int(team_max):
+        return False
+    if is_user not in (0, 1):
+        return False
+    if obj_addr <= 0 or obj_addr > 0x3FFFFFFF:
+        return False
+    for v in pos + m:
+        if not math.isfinite(float(v)):
+            return False
+        if abs(float(v)) > 1000000.0:
+            return False
+    return True
+
+
+def _bzn64_pick_entity_starts(
+    tokens: Sequence[Bzn64Token],
+    start_idx: int,
+    entity_count: int,
+    known_prjid_ids: set[int],
+    team_max: int,
+) -> Tuple[List[int], List[int], str]:
+    n = len(tokens)
+    if entity_count <= 0:
+        return [], [], "none"
+
+    def _collect(prj_ids: Optional[set[int]]) -> List[int]:
+        return [
+            i
+            for i in range(max(0, int(start_idx)), max(0, n - 7))
+            if _bzn64_is_candidate_entity_start(tokens, i, known_prjid_ids=prj_ids, team_max=team_max)
+        ]
+
+    def _greedy(cands: Sequence[int]) -> List[int]:
+        out: List[int] = []
+        cur = max(0, int(start_idx))
+        for _ in range(max(0, int(entity_count))):
+            nxt = next((i for i in cands if i >= cur), None)
+            if nxt is None:
+                break
+            out.append(int(nxt))
+            cur = int(nxt) + 8
+        return out
+
+    strict_cands = _collect(known_prjid_ids if known_prjid_ids else None)
+    strict_picks = _greedy(strict_cands)
+    if len(strict_picks) == int(entity_count):
+        return strict_picks, strict_cands, "strict"
+
+    relaxed_cands = _collect(None)
+    relaxed_picks = _greedy(relaxed_cands)
+    if len(relaxed_picks) > len(strict_picks):
+        return relaxed_picks, relaxed_cands, "relaxed_prjid"
+    return strict_picks, strict_cands, "strict_partial"
+
+
+def _bzn64_prjid_name(prjid_id: int, enum_map: Dict[int, str]) -> str:
+    if int(prjid_id) in enum_map:
+        return str(enum_map[int(prjid_id)])
+    return f"bzn64prjid_{int(prjid_id):04X}"
+
+
+def _bzn64_entity_record(
+    tokens: Sequence[Bzn64Token],
+    start_idx: int,
+    next_start_idx: int,
+    prjid_enum: Dict[int, str],
+    class_labels: Dict[str, List[str]],
+) -> Dict[str, object]:
+    t0 = tokens[start_idx + 0]
+    t1 = tokens[start_idx + 1]
+    t2 = tokens[start_idx + 2]
+    t3 = tokens[start_idx + 3]
+    t4 = tokens[start_idx + 4]
+    t5 = tokens[start_idx + 5]
+    t6 = tokens[start_idx + 6]
+    t7 = tokens[start_idx + 7]
+
+    prjid_id = _bzn64_u16(t0)
+    prjid = _bzn64_prjid_name(prjid_id, prjid_enum)
+    cls = class_labels.get(prjid.lower(), [])
+    pos = _bzn64_f32_vec(t2, 3)
+    m = _bzn64_f32_vec(t7, 12)
+
+    payload_start = int(start_idx) + 8
+    payload_end = max(payload_start, int(next_start_idx))
+    payload_bytes = sum(int(tokens[i].size) for i in range(payload_start, payload_end))
+
+    return {
+        "token_start_index": int(start_idx),
+        "token_start_offset": int(tokens[start_idx].offset),
+        "token_end_index_exclusive": int(next_start_idx),
+        "prjid_id": int(prjid_id),
+        "prjid": str(prjid),
+        "class_candidates": list(cls),
+        "seqno": int(_bzn64_u16(t1)),
+        "pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+        "team": int(_bzn64_u32(t3)),
+        "label_id": int(_bzn64_u16(t4)),
+        "label_name": f"bzn64label_{int(_bzn64_u16(t4)):04X}",
+        "is_user": bool(_bzn64_u32(t5)),
+        "obj_addr": int(_bzn64_u32(t6)),
+        "transform_old": {
+            "right": [float(m[0]), float(m[1]), float(m[2])],
+            "up": [float(m[3]), float(m[4]), float(m[5])],
+            "front": [float(m[6]), float(m[7]), float(m[8])],
+            "posit": [float(m[9]), float(m[10]), float(m[11])],
+        },
+        "payload_token_start": int(payload_start),
+        "payload_token_count": int(max(0, payload_end - payload_start)),
+        "payload_bytes": int(payload_bytes),
+    }
+
+
+def cmd_bzn64_entity_dump(args: argparse.Namespace) -> int:
+    in_dir = pathlib.Path(args.indir)
+    all_files = sorted(in_dir.glob("*.bzn"))
+    files = _filter_bzn_files(
+        all_files,
+        focus_patterns=list(getattr(args, "focus_name", []) or []),
+        use_priority_set=bool(getattr(args, "focus_priority_set", False)),
+    )
+    if not files:
+        raise FileNotFoundError(f"No matching .bzn files found in {in_dir}")
+
+    prjid_enum_path = str(getattr(args, "prjid_enum", "") or "").strip()
+    if not prjid_enum_path:
+        p = _pick_existing_path(
+            [
+                "BZN64_Enum_PrjID.txt",
+                ".tmp_BZNTools/BZNParser/BZN64_Enum_PrjID.txt",
+            ]
+        )
+        prjid_enum_path = str(p) if p is not None else ""
+    class_labels_path = str(getattr(args, "class_labels", "") or "").strip()
+    if not class_labels_path:
+        p = _pick_existing_path(
+            [
+                "BZ1_ClassLabels.txt",
+                ".tmp_BZNTools/BZNParser/BZ1_ClassLabels.txt",
+            ]
+        )
+        class_labels_path = str(p) if p is not None else ""
+
+    prjid_enum = _load_bzn64_prjid_enum(prjid_enum_path if prjid_enum_path else None)
+    class_labels = _load_bz1_class_labels(class_labels_path if class_labels_path else None)
+    known_prjid_ids = set(int(k) for k in prjid_enum.keys())
+    team_max = max(0, int(args.team_max))
+    max_entities_per_file = max(0, int(args.max_entities_per_file))
+
+    records: List[Dict[str, object]] = []
+    prjid_totals: Counter[str] = Counter()
+    class_totals: Counter[str] = Counter()
+    parse_mode_counts: Counter[str] = Counter()
+    fail_count = 0
+
+    for p in files:
+        rec: Dict[str, object] = {
+            "file": str(p),
+            "name": p.name,
+            "stem": _base_bzn_stem(p),
+            "size": int(p.stat().st_size),
+        }
+        try:
+            data = p.read_bytes()
+            tokens, tok_err = _bzn64_read_tokens(data)
+            rec["token_count"] = int(len(tokens))
+            if tok_err:
+                rec["ok"] = False
+                rec["error"] = tok_err
+                records.append(rec)
+                fail_count += 1
+                continue
+            if len(tokens) < 4:
+                rec["ok"] = False
+                rec["error"] = f"Too few tokens ({len(tokens)})"
+                records.append(rec)
+                fail_count += 1
+                continue
+
+            # N64 container header (context-inferred in BZNTools).
+            rec["header"] = {
+                "seq_count": int(_bzn64_u32(tokens[0])) if tokens[0].size >= 4 else None,
+                "mission_save_raw": int(tokens[1].payload[0]) if tokens[1].size >= 1 else None,
+                "mission_save": bool(tokens[1].payload[0]) if tokens[1].size >= 1 else None,
+                "terrain_name": _bzn64_ascii_cstr(tokens[2]),
+                "entity_count_declared": int(_bzn64_u32(tokens[3])) if tokens[3].size >= 4 else None,
+                "header_token_sizes": [int(tokens[i].size) for i in range(4)],
+            }
+
+            entity_count = int(rec["header"]["entity_count_declared"]) if rec["header"]["entity_count_declared"] is not None else 0  # type: ignore[index]
+            starts, candidates, parse_mode = _bzn64_pick_entity_starts(
+                tokens=tokens,
+                start_idx=4,
+                entity_count=entity_count,
+                known_prjid_ids=known_prjid_ids,
+                team_max=team_max,
+            )
+            parse_mode_counts[parse_mode] += 1
+            rec["entity_parse_mode"] = parse_mode
+            rec["entity_start_candidates"] = int(len(candidates))
+            rec["entity_start_indices_preview"] = [int(x) for x in candidates[: max(1, int(args.candidate_preview))]]
+            rec["entity_count_parsed"] = int(len(starts))
+            rec["entity_count_match"] = bool(len(starts) == entity_count)
+
+            ents: List[Dict[str, object]] = []
+            for i, st in enumerate(starts):
+                if max_entities_per_file > 0 and i >= max_entities_per_file:
+                    break
+                nxt = starts[i + 1] if (i + 1) < len(starts) else len(tokens)
+                er = _bzn64_entity_record(tokens, st, nxt, prjid_enum=prjid_enum, class_labels=class_labels)
+                ents.append(er)
+                prjid = str(er["prjid"])
+                prjid_totals[prjid] += 1
+                cls_list = cast(List[str], er.get("class_candidates", []))
+                if cls_list:
+                    for c in cls_list:
+                        class_totals[str(c)] += 1
+
+            rec["entities"] = ents
+            rec["ok"] = True
+            if len(starts) != entity_count:
+                rec["warning"] = f"Declared {entity_count} entities, parsed {len(starts)} starts"
+        except Exception as ex:
+            rec["ok"] = False
+            rec["error"] = str(ex)
+            fail_count += 1
+        records.append(rec)
+
+    out_obj = {
+        "summary": {
+            "input_dir": str(in_dir),
+            "count_total": len(all_files),
+            "count_selected": len(files),
+            "count_ok": sum(1 for r in records if bool(r.get("ok"))),
+            "count_failed": int(fail_count),
+            "focus_patterns": list(getattr(args, "focus_name", []) or []),
+            "focus_priority_set": bool(getattr(args, "focus_priority_set", False)),
+            "prjid_enum_path": (prjid_enum_path if prjid_enum_path else None),
+            "prjid_enum_loaded": int(len(prjid_enum)),
+            "class_labels_path": (class_labels_path if class_labels_path else None),
+            "class_labels_loaded": int(len(class_labels)),
+            "entity_parse_mode_counts": dict(parse_mode_counts),
+            "entity_count_match_files": sum(1 for r in records if bool(r.get("entity_count_match"))),
+            "entity_count_mismatch_files": sum(1 for r in records if (r.get("ok") and not bool(r.get("entity_count_match")))),
+            "prjid_totals": [
+                {"prjid": str(k), "count": int(v)}
+                for k, v in prjid_totals.most_common(max(1, int(args.top_values)))
+            ],
+            "class_candidate_totals": [
+                {"class": str(k), "count": int(v)}
+                for k, v in class_totals.most_common(max(1, int(args.top_values)))
+            ],
+        },
+        "records": records,
+    }
+
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out_obj, indent=2), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "out": str(out_path),
+                "count_selected": len(files),
+                "count_ok": out_obj["summary"]["count_ok"],
+                "count_failed": out_obj["summary"]["count_failed"],
+                "entity_count_mismatch_files": out_obj["summary"]["entity_count_mismatch_files"],
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -4185,12 +4856,14 @@ def cmd_terrain_cluster(args: argparse.Namespace) -> int:
             rng = max(1, mx - mn)
             norm = [int((v - mn) * 255 / rng) for v in be]
 
-            for suffix, data in [("hi", hi), ("lo", lo), ("be", hi), ("u16norm", norm)]:
+            for suffix, data in [("hi", hi), ("lo", lo), ("u16norm", norm)]:
                 img = Image.new("L", (128, 128))
                 img.putdata(data)
                 p = out_dir / f"{off:08X}_{suffix}.png"
                 img.save(p)
                 rec[suffix] = str(p)
+            # Keep legacy key for downstream tools without writing a duplicate PNG.
+            rec["be"] = rec["u16norm"]
 
             rec["kind"] = "u16_128x128"
             u16_offs.append(off)
@@ -4247,7 +4920,7 @@ def cmd_terrain_cluster(args: argparse.Namespace) -> int:
         )
 
     # Tag user-validated lightmaps if provided.
-    validated = {int(x, 0) for x in args.valid_lightmap_offset}
+    validated = set(_parse_num_list_loose(args.valid_lightmap_offset or []))
     for rec in records:
         rec["validated_lightmap"] = bool(rec["offset"] in validated and rec.get("kind") == "u16_128x128")
 
@@ -4325,6 +4998,108 @@ def _untile_morton(samples: Sequence[int], w: int, h: int, ts: int) -> List[int]
                     continue
                 out[(ty + y) * w + (tx + x)] = samples[si]
                 si += 1
+    return out
+
+
+def _repack_chunk_grid_linear(
+    samples: Sequence[int],
+    w: int,
+    h: int,
+    chunk_w: int,
+    chunk_h: int,
+    reverse_rows: bool = False,
+    reverse_cols: bool = False,
+    column_major_stream: bool = False,
+) -> List[int]:
+    # Repack sequential chunk payloads (each chunk row-major) into a full image grid.
+    if chunk_w <= 0 or chunk_h <= 0:
+        raise ValueError("invalid chunk size")
+    if (w % chunk_w) != 0 or (h % chunk_h) != 0:
+        raise ValueError("chunk size must evenly divide output dimensions")
+    gx = w // chunk_w
+    gy = h // chunk_h
+    if gx <= 0 or gy <= 0:
+        raise ValueError("invalid chunk grid")
+    chunk_px = chunk_w * chunk_h
+    total_px = w * h
+    if len(samples) != total_px:
+        raise ValueError("sample length does not match output dimensions")
+    if (gx * gy * chunk_px) != total_px:
+        raise ValueError("invalid chunk grid pixel count")
+
+    out = [0] * total_px
+    si = 0
+    y_order = list(range(gy))
+    x_order = list(range(gx))
+    if reverse_rows:
+        y_order = list(reversed(y_order))
+    if reverse_cols:
+        x_order = list(reversed(x_order))
+    if column_major_stream:
+        coords = [(cx, cy) for cx in x_order for cy in y_order]
+    else:
+        coords = [(cx, cy) for cy in y_order for cx in x_order]
+    for cx, cy in coords:
+        ox = cx * chunk_w
+        oy = cy * chunk_h
+        block = samples[si : si + chunk_px]
+        if len(block) != chunk_px:
+            raise ValueError("truncated chunk stream during repack")
+        si += chunk_px
+        for y in range(chunk_h):
+            src = y * chunk_w
+            dst = (oy + y) * w + ox
+            out[dst : dst + chunk_w] = block[src : src + chunk_w]
+    return out
+
+
+def _repack_chunk_grid_permutation(
+    samples: Sequence[int],
+    w: int,
+    h: int,
+    chunk_w: int,
+    chunk_h: int,
+    order: Sequence[int],
+) -> List[int]:
+    # Repack chunk stream using an explicit source->destination chunk order.
+    if chunk_w <= 0 or chunk_h <= 0:
+        raise ValueError("invalid chunk size")
+    if (w % chunk_w) != 0 or (h % chunk_h) != 0:
+        raise ValueError("chunk size must evenly divide output dimensions")
+    gx = w // chunk_w
+    gy = h // chunk_h
+    chunk_count = gx * gy
+    if len(order) != chunk_count:
+        raise ValueError("chunk permutation length mismatch")
+    if sorted(int(i) for i in order) != list(range(chunk_count)):
+        raise ValueError("chunk permutation must be a full reordering of all chunk indices")
+    chunk_px = chunk_w * chunk_h
+    total_px = w * h
+    if len(samples) != total_px:
+        raise ValueError("sample length does not match output dimensions")
+
+    blocks: List[Sequence[int]] = []
+    for ci in range(chunk_count):
+        s0 = ci * chunk_px
+        s1 = s0 + chunk_px
+        block = samples[s0:s1]
+        if len(block) != chunk_px:
+            raise ValueError("truncated chunk stream during permutation repack")
+        blocks.append(block)
+
+    out = [0] * total_px
+    for dst_ci, src_ci in enumerate(order):
+        if src_ci < 0 or src_ci >= chunk_count:
+            raise ValueError("chunk permutation index out of range")
+        cx = dst_ci % gx
+        cy = dst_ci // gx
+        ox = cx * chunk_w
+        oy = cy * chunk_h
+        block = blocks[src_ci]
+        for y in range(chunk_h):
+            src = y * chunk_w
+            dst = (oy + y) * w + ox
+            out[dst : dst + chunk_w] = block[src : src + chunk_w]
     return out
 
 
@@ -4772,6 +5547,39 @@ def _u16_dup_score(samples: Sequence[int], w: int, h: int) -> float:
     return (total / cnt) / 65535.0
 
 
+def _u16_highfreq_penalty(samples: Sequence[int], w: int, h: int) -> float:
+    # Penalize high-frequency grain using second derivatives.
+    # This catches static-like roughness that basic neighbor smoothness can miss.
+    if w < 3 or h < 3:
+        return 0.0
+    total = 0
+    cnt = 0
+    for y in range(1, h - 1):
+        row = y * w
+        up = (y - 1) * w
+        dn = (y + 1) * w
+        for x in range(1, w - 1):
+            i = row + x
+            d2x = abs(int(samples[i - 1]) - (2 * int(samples[i])) + int(samples[i + 1]))
+            d2y = abs(int(samples[up + x]) - (2 * int(samples[i])) + int(samples[dn + x]))
+            total += d2x + d2y
+            cnt += 2
+    if cnt <= 0:
+        return 0.0
+    return (total / cnt) / 65535.0
+
+
+def _u16_chunkstream_seam_penalty(samples: Sequence[int], w: int, h: int) -> float:
+    # Larger terrain maps can be stored as sequential 128x128 chunks.
+    # Wrong linear interpretation often creates strong seams at 64/128 periods.
+    if w < 256 and h < 256:
+        return 0.0
+    periods: List[int] = [64]
+    if (w % 128) == 0 and (h % 128) == 0:
+        periods.append(128)
+    return _grid_seam_penalty(samples, w, h, periods=periods)
+
+
 def _u16_layout_score(samples: Sequence[int], w: int, h: int) -> float:
     # Use absolute neighbor difference to avoid range-normalization bias.
     # Heightmaps should be smooth relative to the 16-bit depth (65535).
@@ -4779,12 +5587,23 @@ def _u16_layout_score(samples: Sequence[int], w: int, h: int) -> float:
     dup = _u16_dup_score(samples, w, h)
     repeat = _u16_periodic_repeat_penalty(samples, w, h)
     seam = _grid_seam_penalty(samples, w, h, periods=[8, 16, 32])
+    chunkstream_seam = _u16_chunkstream_seam_penalty(samples, w, h)
     interlace = _row_interlace_penalty(samples, w, h, 65535.0)
+    highfreq = _u16_highfreq_penalty(samples, w, h)
     # Prefer square-ish layouts.
     aspect_penalty = 0.08 * abs(math.log2(max(w, h) / max(1, min(w, h))))
     # Penalty for noise and suspiciously high duplication.
     # Lower is better.
-    return (10.0 * smooth) + aspect_penalty + (0.5 * max(0.0, 0.1 - dup)) + (0.9 * repeat) + (0.7 * seam) + (1.0 * interlace)
+    return (
+        (10.0 * smooth)
+        + aspect_penalty
+        + (0.5 * max(0.0, 0.1 - dup))
+        + (0.9 * repeat)
+        + (0.7 * seam)
+        + (0.8 * chunkstream_seam)
+        + (1.0 * interlace)
+        + (1.8 * highfreq)
+    )
 
 
 def _parse_dim_list(spec: str, total_px: int) -> List[Tuple[int, int]]:
@@ -4923,9 +5742,9 @@ def cmd_height_candidates(args: argparse.Namespace) -> int:
 
     start = int(args.start, 0)
     end = int(args.end, 0)
-    valid_light = {int(x, 0) for x in args.valid_lightmap_offset}
-    valid_height_le = {int(x, 0) for x in args.valid_height_le_offset}
-    valid_light_be = {int(x, 0) for x in args.valid_light_be_offset}
+    valid_light = set(_parse_num_list_loose(args.valid_lightmap_offset or []))
+    valid_height_le = set(_parse_num_list_loose(args.valid_height_le_offset or []))
+    valid_light_be = set(_parse_num_list_loose(args.valid_light_be_offset or []))
 
     headers = [o for o in find_yay0_headers(rom) if start <= o <= end]
     u16_offsets: List[int] = []
@@ -5073,8 +5892,8 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
         raise RuntimeError("Pillow is required for terrain PNG export: pip install pillow")
 
     headers = find_yay0_headers(rom)
-    start = int(args.start, 0) if args.start is not None else BZ64_DEFAULT_TERRAIN_RANGE[0]
-    end = int(args.end, 0) if args.end is not None else BZ64_DEFAULT_TERRAIN_RANGE[1]
+    start = int(args.start, 0) if args.start is not None else 0
+    end = int(args.end, 0) if args.end is not None else (len(rom) - 1)
     if start < 0:
         start = 0
     if end >= len(rom):
@@ -5082,6 +5901,31 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
     if end < start:
         raise ValueError("Invalid terrain range: --end must be greater than or equal to --start")
     headers = [o for o in headers if start <= o <= end]
+
+    # Avoid writing duplicate grayscale PNGs when two variants are byte-identical.
+    l8_export_cache: Dict[Tuple[int, int, str], pathlib.Path] = {}
+    l8_dedup_reused = 0
+
+    def _write_l8_dedup(path: pathlib.Path, w: int, h: int, data: Sequence[int]) -> pathlib.Path:
+        nonlocal l8_dedup_reused
+        key = (int(w), int(h), _md5_hex(bytes((int(v) & 0xFF) for v in data)))
+        existing = l8_export_cache.get(key)
+        if existing is not None:
+            l8_dedup_reused += 1
+            return existing
+        _write_l8(path, int(w), int(h), data)
+        l8_export_cache[key] = path
+        return path
+
+    def _write_png_alias(src: pathlib.Path, alias: pathlib.Path) -> pathlib.Path:
+        # Always refresh stable alias names so users don't read stale variant files.
+        try:
+            if src.resolve() == alias.resolve():
+                return src
+        except Exception:
+            pass
+        alias.write_bytes(src.read_bytes())
+        return alias
 
     u16_records: List[Dict[str, object]] = []
     paint_records: List[Dict[str, object]] = []
@@ -5197,6 +6041,78 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                                     "score": _u16_layout_score(rp, w, h),
                                     "is_8bit": is_8bit,
                                 })
+                    # Some terrain banks store full maps as sequential 128x128 chunks
+                    # that must be repacked into the final larger square.
+                    if (w > 128 or h > 128) and (w % 128) == 0 and (h % 128) == 0:
+                        for col_major in [False, True]:
+                            for rev_rows, rev_cols in [
+                                (False, False),
+                                (True, False),
+                                (False, True),
+                                (True, True),
+                            ]:
+                                p = _repack_chunk_grid_linear(
+                                    base,
+                                    w,
+                                    h,
+                                    128,
+                                    128,
+                                    reverse_rows=rev_rows,
+                                    reverse_cols=rev_cols,
+                                    column_major_stream=col_major,
+                                )
+                                n = f"{tag}_chunkgrid128"
+                                if col_major:
+                                    n += "_colmajor"
+                                if rev_rows:
+                                    n += "_revrows"
+                                if rev_cols:
+                                    n += "_revcols"
+                                n += f"_{w}x{h}"
+                                rows.append({
+                                    "name": n,
+                                    "w": w,
+                                    "h": h,
+                                    "pixels": p,
+                                    "score": _u16_layout_score(p, w, h),
+                                    "is_8bit": is_8bit,
+                                })
+                                for rn, rp in [
+                                    ("zipeo", _row_zip_evenodd(p, w, h, odd_first=False)),
+                                    ("unzipoe", _row_unzip_evenodd(p, w, h, odd_first=True)),
+                                ]:
+                                    rows.append({
+                                        "name": f"{n}_{rn}",
+                                        "w": w,
+                                        "h": h,
+                                        "pixels": rp,
+                                        "score": _u16_layout_score(rp, w, h),
+                                        "is_8bit": is_8bit,
+                                    })
+                        # For 2x2 chunk grids, brute-force all chunk placement orders.
+                        # This catches maps that are legible but arranged out-of-order.
+                        if tag in ("be", "le") and (w // 128) == 2 and (h // 128) == 2:
+                            for perm in itertools.permutations(range(4)):
+                                if perm == (0, 1, 2, 3):
+                                    continue
+                                p = _repack_chunk_grid_permutation(
+                                    base,
+                                    w,
+                                    h,
+                                    128,
+                                    128,
+                                    perm,
+                                )
+                                pn = "".join(str(int(i)) for i in perm)
+                                n = f"{tag}_chunkgrid128_perm{pn}_{w}x{h}"
+                                rows.append({
+                                    "name": n,
+                                    "w": w,
+                                    "h": h,
+                                    "pixels": p,
+                                    "score": _u16_layout_score(p, w, h),
+                                    "is_8bit": is_8bit,
+                                })
                 rows.sort(key=lambda r: float(r["score"]))
                 return rows
 
@@ -5235,18 +6151,45 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             layer1_png = out_dir / f"{off:08X}_layer1_{best_v1['name']}.png"
             layer2_png = out_dir / f"{off:08X}_layer2_{best_v2['name']}.png"
 
-            _write_l8(layer1_png, int(best_v1["w"]), int(best_v1["h"]), _u16_to_norm8(best_v1["pixels"]))
-            _write_l8(layer2_png, int(best_v2["w"]), int(best_v2["h"]), _u16_to_norm8(best_v2["pixels"]))
+            layer1_png = _write_l8_dedup(
+                layer1_png,
+                int(best_v1["w"]),
+                int(best_v1["h"]),
+                _u16_to_norm8(best_v1["pixels"]),
+            )
+            layer2_png = _write_l8_dedup(
+                layer2_png,
+                int(best_v2["w"]),
+                int(best_v2["h"]),
+                _u16_to_norm8(best_v2["pixels"]),
+            )
+            layer1_best_alias = _write_png_alias(layer1_png, out_dir / f"{off:08X}_layer1_best.png")
+            layer2_best_alias = _write_png_alias(layer2_png, out_dir / f"{off:08X}_layer2_best.png")
 
             # Keep explicit BE/LE exports for light/height compatibility.
             be_best = be_vars[0]
             le_best = le_vars[0]
             be_png = out_dir / f"{off:08X}_light_{be_best['name']}.png"
             le_png = out_dir / f"{off:08X}_height_{le_best['name']}.png"
-            _write_l8(be_png, int(be_best["w"]), int(be_best["h"]), _u16_to_norm8(be_best["pixels"]))
-            _write_l8(le_png, int(le_best["w"]), int(le_best["h"]), _u16_to_norm8(le_best["pixels"]))
+            be_png = _write_l8_dedup(
+                be_png,
+                int(be_best["w"]),
+                int(be_best["h"]),
+                _u16_to_norm8(be_best["pixels"]),
+            )
+            le_png = _write_l8_dedup(
+                le_png,
+                int(le_best["w"]),
+                int(le_best["h"]),
+                _u16_to_norm8(le_best["pixels"]),
+            )
 
-            light_best = min([be_vars[0], hi_vars[0]], key=lambda v: float(v["score"]))
+            # Prefer canonical BE light interpretation unless HI is clearly better.
+            light_best_base = be_vars[0]
+            if float(hi_vars[0]["score"]) + 0.060 < float(be_vars[0]["score"]):
+                light_best_base = hi_vars[0]
+            light_pool = sorted([be_vars[0], hi_vars[0]], key=lambda v: float(v["score"]))
+            light_best = _pick_preferred_variant(off, light_pool, light_pref, light_best_base, score_gap=0.65)
             # Prefer LE as height interpretation when scores are close; LO is often less stable.
             height_best_base = min(
                 [le_vars[0], lo_vars[0]],
@@ -5256,29 +6199,31 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             height_best = _pick_preferred_variant(off, height_pool, height_pref, height_best_base, score_gap=0.65)
             light_best_png = out_dir / f"{off:08X}_light_best_{light_best['name']}.png"
             height_best_png = out_dir / f"{off:08X}_height_best_{height_best['name']}.png"
-            _write_l8(
+            light_best_png = _write_l8_dedup(
                 light_best_png,
                 int(light_best["w"]),
                 int(light_best["h"]),
                 _u16_to_norm8(light_best["pixels"]),
             )
-            _write_l8(
+            height_best_png = _write_l8_dedup(
                 height_best_png,
                 int(height_best["w"]),
                 int(height_best["h"]),
                 _u16_to_norm8(height_best["pixels"]),
             )
+            light_best_alias = _write_png_alias(light_best_png, out_dir / f"{off:08X}_light_best.png")
+            height_best_alias = _write_png_alias(height_best_png, out_dir / f"{off:08X}_height_best.png")
 
             be_saved: List[Dict[str, object]] = []
             for v in _top_unique_variants(be_vars, u16_topk):
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
-                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
+                vp = _write_l8_dedup(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 be_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
 
             le_saved: List[Dict[str, object]] = []
             for v in _top_unique_variants(le_vars, u16_topk):
                 vp = out_dir / f"{off:08X}_{v['name']}.png"
-                _write_l8(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
+                vp = _write_l8_dedup(vp, int(v["w"]), int(v["h"]), _u16_to_norm8(v["pixels"]))
                 le_saved.append({"name": v["name"], "score": v["score"], "w": v["w"], "h": v["h"], "png": str(vp)})
 
             # Heuristic: very low unique value count implies indexed/paint-like data.
@@ -5311,13 +6256,17 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                     "best_score": best_v1["score"],
                     "u16_confidence": 1.0 / (1.0 + float(best_v1["score"])),
                     "light_best_png": str(light_best_png),
+                    "light_best_alias_png": str(light_best_alias),
                     "light_best_variant": str(light_best["name"]),
                     "light_best_score": float(light_best["score"]),
                     "height_best_png": str(height_best_png),
+                    "height_best_alias_png": str(height_best_alias),
                     "height_best_variant": str(height_best["name"]),
                     "height_best_score": float(height_best["score"]),
                     "layer1_png": str(layer1_png),
+                    "layer1_best_alias_png": str(layer1_best_alias),
                     "layer2_png": str(layer2_png),
+                    "layer2_best_alias_png": str(layer2_best_alias),
                     "layer1_variant": best_v1["name"],
                     "layer2_variant": best_v2["name"],
                     "score_layer1": float(best_v1["score"]),
@@ -5413,7 +6362,7 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             pw = int(best["w"])
             ph = int(best["h"])
             p = out_dir / f"{off:08X}_paint_{best['name_with_dims']}.png"
-            _write_l8(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
+            p = _write_l8_dedup(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
             paint_square_png: Optional[pathlib.Path] = None
             paint_clean_square_png: Optional[pathlib.Path] = None
             side = int(round(math.sqrt(float(pw * ph))))
@@ -5435,7 +6384,7 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                         passes=int(args.paint_denoise_passes),
                     )
                     clean_l8 = _ci4_idx_to_l8(idx_clean)
-                _write_l8(p_clean, pw, ph, clean_l8)
+                p_clean = _write_l8_dedup(p_clean, pw, ph, clean_l8)
                 paint_clean_png = p_clean
                 if pw != ph and (side * side) == (pw * ph):
                     p_clean_square = out_dir / f"{off:08X}_paint_clean_square_{best['name_with_dims']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}_{side}x{side}.png"
@@ -5445,7 +6394,9 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             for v in _top_unique_variants(dim_variants, topk):
                 vp = out_dir / f"{off:08X}_paint_{v['name_with_dims']}.png"
                 if str(vp) != str(p):
-                    _write_l8(vp, int(v["w"]), int(v["h"]), v["pixels"])  # type: ignore[arg-type]
+                    vp = _write_l8_dedup(vp, int(v["w"]), int(v["h"]), v["pixels"])  # type: ignore[arg-type]
+                else:
+                    vp = p
                 variant_files.append(
                     {
                         "name": v["name"],
@@ -5497,7 +6448,7 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                 variants = _ci4_variant_images(chunk, w=pw, h=ph)
                 best = variants[0]
                 p = out_dir / f"{off:08X}_part{part}_paint_{best['name']}.png"
-                _write_l8(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
+                p = _write_l8_dedup(p, pw, ph, best["pixels"])  # type: ignore[arg-type]
                 paint_square_png: Optional[pathlib.Path] = None
                 paint_clean_square_png: Optional[pathlib.Path] = None
                 side = int(round(math.sqrt(float(pw * ph))))
@@ -5517,7 +6468,7 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                     )
                     p_clean = out_dir / f"{off:08X}_part{part}_paint_clean_{best['name']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}.png"
                     clean_l8 = _ci4_idx_to_l8(idx_clean)
-                    _write_l8(p_clean, pw, ph, clean_l8)
+                    p_clean = _write_l8_dedup(p_clean, pw, ph, clean_l8)
                     paint_clean_png = p_clean
                     if pw != ph and (side * side) == (pw * ph):
                         p_clean_square = out_dir / f"{off:08X}_part{part}_paint_clean_square_{best['name']}_r{int(args.paint_denoise_radius)}_p{int(args.paint_denoise_passes)}_{side}x{side}.png"
@@ -5527,7 +6478,9 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
                 for v in variants[:topk]:
                     vp = out_dir / f"{off:08X}_part{part}_paint_{v['name']}.png"
                     if str(vp) != str(p):
-                        _write_l8(vp, pw, ph, v["pixels"])  # type: ignore[arg-type]
+                        vp = _write_l8_dedup(vp, pw, ph, v["pixels"])  # type: ignore[arg-type]
+                    else:
+                        vp = p
                     variant_files.append({"name": v["name"], "score": v["score"], "png": str(vp)})
                 paint_records.append(
                     {
@@ -5702,6 +6655,8 @@ def cmd_terrain_all(args: argparse.Namespace) -> int:
             "unique_u16": len(unique_u16),
             "unique_paint": len(unique_paint),
             "other_chunks": len(other_records),
+            "l8_unique_exports": len(l8_export_cache),
+            "l8_dedup_reused": int(l8_dedup_reused),
         },
         "u16_records": u16_records,
         "paint_records": paint_records,
@@ -6126,8 +7081,8 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
         start = 0
     if end >= len(rom):
         end = len(rom) - 1
-    if end <= start:
-        raise ValueError("Invalid scan range: --end must be greater than --start")
+    if end < start:
+        raise ValueError("Invalid scan range: --end must be greater than or equal to --start")
 
     scan_step = max(2, int(args.step))
     if (scan_step % 2) != 0:
@@ -6162,18 +7117,24 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
     ]
     coarse_threshold = float(args.coarse_threshold)
 
-    fine_recipes: List[Tuple[str, int, int, int, int, Sequence[Optional[int]]]] = []
-    for w, h in dims:
-        fine_recipes.append(("ci4", 2, 0, int(w), int(h), list(pal_deltas)))
-        if ci8_max_pixels <= 0 or (int(w) * int(h)) <= ci8_max_pixels:
-            fine_recipes.append(("ci8", 2, 1, int(w), int(h), list(pal_deltas)))
-        if not bool(args.ci_only):
-            fine_recipes.append(("i4", 4, 0, int(w), int(h), [None]))
-            fine_recipes.append(("i8", 4, 1, int(w), int(h), [None]))
-            fine_recipes.append(("ia4", 3, 0, int(w), int(h), [None]))
-            fine_recipes.append(("ia8", 3, 1, int(w), int(h), [None]))
-            fine_recipes.append(("ia16", 3, 2, int(w), int(h), [None]))
-            fine_recipes.append(("rgba16", 0, 2, int(w), int(h), [None]))
+    def _build_scan_recipes(dim_list: Sequence[Tuple[int, int]]) -> List[Tuple[str, int, int, int, int, Sequence[Optional[int]]]]:
+        out: List[Tuple[str, int, int, int, int, Sequence[Optional[int]]]] = []
+        for w, h in dim_list:
+            iw = int(w)
+            ih = int(h)
+            out.append(("ci4", 2, 0, iw, ih, list(pal_deltas)))
+            if ci8_max_pixels <= 0 or (iw * ih) <= ci8_max_pixels:
+                out.append(("ci8", 2, 1, iw, ih, list(pal_deltas)))
+            if not bool(args.ci_only):
+                out.append(("i4", 4, 0, iw, ih, [None]))
+                out.append(("i8", 4, 1, iw, ih, [None]))
+                out.append(("ia4", 3, 0, iw, ih, [None]))
+                out.append(("ia8", 3, 1, iw, ih, [None]))
+                out.append(("ia16", 3, 2, iw, ih, [None]))
+                out.append(("rgba16", 0, 2, iw, ih, [None]))
+        return out
+
+    fine_recipes = _build_scan_recipes(dims)
     fine_threshold = float(args.threshold)
 
     # 1) Coarse scan.
@@ -6240,6 +7201,46 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
     fine_hits_by_hash: Dict[str, Dict[str, object]] = {}
     fine_scanned = 0
     accepted = 0
+    seed_probe_scanned = 0
+    accepted_seed_probe = 0
+
+    def _merge_scan_hit(best_hit: Optional[Dict[str, object]]) -> bool:
+        if best_hit is None:
+            return False
+        pixels_obj = best_hit.get("pixels")
+        if not isinstance(pixels_obj, list):
+            return False
+        pixels = cast(List[Tuple[int, int, int, int]], pixels_obj)
+        ref = {
+            "offset": int(best_hit["offset"]),
+            "score": float(best_hit["score"]),
+            "recipe": str(best_hit["recipe"]),
+            "fmt": int(best_hit["fmt"]),
+            "siz": int(best_hit["siz"]),
+            "w": int(best_hit["w"]),
+            "h": int(best_hit["h"]),
+            "pal_offset": best_hit["pal_offset"],
+            "pal_delta": best_hit["pal_delta"],
+        }
+        rgba_md5 = _rgba_pixels_md5(pixels)
+        rec = fine_hits_by_hash.get(rgba_md5)
+        if rec is None:
+            fine_hits_by_hash[rgba_md5] = {
+                "png_md5": rgba_md5,
+                "best": dict(ref),
+                "pixels": pixels,
+                "refs": [ref],
+            }
+            return True
+        rec_refs = rec.get("refs")
+        if isinstance(rec_refs, list) and len(rec_refs) < 24:
+            rec_refs.append(ref)
+        best_old = rec.get("best")
+        if isinstance(best_old, dict) and float(ref["score"]) < float(best_old.get("score", 999.0)):
+            rec["best"] = dict(ref)
+            rec["pixels"] = pixels
+        return True
+
     for off in sorted(fine_offsets):
         fine_scanned += 1
         best = _scan_texture_best_at(
@@ -6251,40 +7252,59 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
             allow_pal_overlap=allow_pal_overlap,
             max_score=fine_threshold,
         )
-        if best is None:
+        if _merge_scan_hit(best):
+            accepted += 1
+
+    # 4) Seed rescue: explicitly probe unmatched seed offsets with broader dims
+    # and tolerant CI palette-overlap handling. This recovers known references
+    # where palette and image data are interleaved/adjacent in ROM.
+    matched_offsets: set[int] = set()
+    for row in fine_hits_by_hash.values():
+        refs_obj = row.get("refs")
+        if not isinstance(refs_obj, list):
             continue
-        pixels = best.pop("pixels")
-        if not isinstance(pixels, list):
+        for rr in refs_obj:
+            if not isinstance(rr, dict):
+                continue
+            try:
+                matched_offsets.add(int(rr.get("offset", -1)))
+            except Exception:
+                continue
+
+    seed_probe_dims = list(dims)
+    for d in [
+        (64, 64),
+        (128, 128),
+        (256, 256),
+        (320, 240),
+        (320, 224),
+        (256, 240),
+        (128, 64),
+        (64, 128),
+        (256, 128),
+        (128, 256),
+    ]:
+        if d not in seed_probe_dims:
+            seed_probe_dims.append(d)
+    seed_probe_recipes = _build_scan_recipes(seed_probe_dims)
+    seed_probe_threshold = float(fine_threshold + 0.40)
+
+    for s in seed_offsets:
+        so = int(s)
+        if so in matched_offsets:
             continue
-        accepted += 1
-        rgba_md5 = _rgba_pixels_md5(pixels)
-        rec = fine_hits_by_hash.get(rgba_md5)
-        ref = {
-            "offset": int(best["offset"]),
-            "score": float(best["score"]),
-            "recipe": str(best["recipe"]),
-            "fmt": int(best["fmt"]),
-            "siz": int(best["siz"]),
-            "w": int(best["w"]),
-            "h": int(best["h"]),
-            "pal_offset": best["pal_offset"],
-            "pal_delta": best["pal_delta"],
-        }
-        if rec is None:
-            fine_hits_by_hash[rgba_md5] = {
-                "png_md5": rgba_md5,
-                "best": dict(ref),
-                "pixels": pixels,
-                "refs": [ref],
-            }
-            continue
-        rec_refs = rec.get("refs")
-        if isinstance(rec_refs, list) and len(rec_refs) < 24:
-            rec_refs.append(ref)
-        best_old = rec.get("best")
-        if isinstance(best_old, dict) and float(ref["score"]) < float(best_old.get("score", 999.0)):
-            rec["best"] = dict(ref)
-            rec["pixels"] = pixels
+        seed_probe_scanned += 1
+        best = _scan_texture_best_at(
+            data=rom,
+            off=so,
+            recipes=seed_probe_recipes,
+            min_pal_unique=min_pal_unique,
+            min_pal256_unique=min_pal256_unique,
+            allow_pal_overlap=True,
+            max_score=seed_probe_threshold,
+        )
+        if _merge_scan_hit(best):
+            accepted_seed_probe += 1
 
     unique_rows = sorted(
         fine_hits_by_hash.values(),
@@ -6330,13 +7350,16 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
             "ci8_max_pixels": int(ci8_max_pixels),
             "coarse_threshold": float(coarse_threshold),
             "threshold": float(fine_threshold),
+            "seed_probe_threshold": float(seed_probe_threshold),
             "min_pal_unique": int(min_pal_unique),
             "min_pal256_unique": int(min_pal256_unique),
             "allow_pal_overlap": bool(allow_pal_overlap),
+            "seed_probe_allow_pal_overlap": True,
             "ci_only": bool(args.ci_only),
             "coarse_keep": int(coarse_keep),
             "coarse_dedupe_radius": int(coarse_dedupe_radius),
             "keep": int(keep_n),
+            "seed_probe_dims": [f"{int(w)}x{int(h)}" for (w, h) in seed_probe_dims],
             "seed_offset_files": [str(x) for x in (args.seed_offset_file or [])],
             "seed_from_dir": [str(x) for x in (args.seed_from_dir or [])],
         },
@@ -6350,6 +7373,8 @@ def cmd_scan_textures_rom(args: argparse.Namespace) -> int:
             "seed_offsets_total": len(seed_offsets),
             "fine_offsets_scanned": int(fine_scanned),
             "accepted_fine_hits": int(accepted),
+            "seed_probe_offsets_scanned": int(seed_probe_scanned),
+            "accepted_seed_probe_hits": int(accepted_seed_probe),
             "unique_png_md5": len(unique_rows),
             "written_png": len(entries),
         },
@@ -7320,6 +8345,30 @@ def _parse_num_auto(text: str) -> int:
     if re.fullmatch(r"[0-9A-Fa-f]+", t):
         return int(t, 16)
     return int(t, 0)
+
+
+def _parse_num_list_loose(items: Sequence[str]) -> List[int]:
+    vals: List[int] = []
+    for raw in items:
+        s = str(raw).strip()
+        if not s or s in {"[]", "{}", "()", "None", "none", "null"}:
+            continue
+        for tok in re.split(r"[,\s;]+", s):
+            t = tok.strip()
+            if not t or t in {"[]", "{}", "()", "None", "none", "null"}:
+                continue
+            try:
+                vals.append(int(_parse_num_auto(t)))
+            except Exception:
+                continue
+    out: List[int] = []
+    seen: set[int] = set()
+    for v in vals:
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
 
 
 def _parse_bank_pair(pair: str) -> Tuple[int, int]:
@@ -8871,10 +9920,43 @@ def build_parser() -> argparse.ArgumentParser:
     pz.add_argument("--outdir", required=True, help="Output folder for .bzn files")
     pz.set_defaults(func=cmd_extract_bzn)
 
+    pbm = sub.add_parser("bzn-merge", help="Merge extracted .bzn files into a destination directory by ROM offset")
+    pbm.add_argument("--srcdir", required=True, help="Source directory containing .bzn files (and optional manifest.json)")
+    pbm.add_argument("--dstdir", required=True, help="Destination directory to merge into")
+    pbm.add_argument("--manifest", help="Optional explicit manifest.json path to drive merge metadata")
+    pbm.add_argument(
+        "--only-detection-method",
+        choices=["all", "name_regex", "structural"],
+        default="all",
+        help="When manifest metadata is available, only merge entries with this detection method (default: all)",
+    )
+    pbm.add_argument(
+        "--on-conflict",
+        choices=["keep", "copy", "replace"],
+        default="keep",
+        help="Behavior when destination already has same ROM offset but different content (default: keep)",
+    )
+    pbm.add_argument("--dry-run", action="store_true", help="Report merge actions without writing files")
+    pbm.add_argument("--out", help="Optional JSON report output path")
+    pbm.set_defaults(func=cmd_bzn_merge)
+
     pr = sub.add_parser("bzn-refs", help="Extract stable reference fields from extracted .bzn containers")
     pr.add_argument("--indir", required=True, help="Directory containing extracted .bzn files")
     pr.add_argument("--out", required=True, help="Output JSON path")
     pr.set_defaults(func=cmd_bzn_refs)
+
+    pbe = sub.add_parser("bzn64-entity-dump", help="Parse N64-style binary .bzn entity preambles and dump per-entity records")
+    pbe.add_argument("--indir", required=True, help="Directory containing extracted .bzn files")
+    pbe.add_argument("--out", required=True, help="Output JSON report path")
+    pbe.add_argument("--focus-name", action="append", default=[], help="Optional glob pattern for BZN stems, repeatable (e.g. n64dm*).")
+    pbe.add_argument("--focus-priority-set", action="store_true", help="Analyze default high-value set: arcd*, arcdb*, arcds*, n64dm*, race*, misn00, misn20..misn27.")
+    pbe.add_argument("--prjid-enum", help="Optional path to BZN64_Enum_PrjID.txt")
+    pbe.add_argument("--class-labels", help="Optional path to BZ1_ClassLabels.txt")
+    pbe.add_argument("--team-max", type=int, default=16, help="Maximum allowed team value for entity-start detection (default: 16)")
+    pbe.add_argument("--max-entities-per-file", type=int, default=0, help="Limit emitted entities per file (0 = all)")
+    pbe.add_argument("--candidate-preview", type=int, default=24, help="How many candidate token indices to keep per file (default: 24)")
+    pbe.add_argument("--top-values", type=int, default=64, help="How many top aggregate prjid/class totals to keep (default: 64)")
+    pbe.set_defaults(func=cmd_bzn64_entity_dump)
 
     pic = sub.add_parser("bzn-id-census", help="Census candidate numeric IDs in extracted .bzn containers")
     pic.add_argument("--indir", required=True, help="Directory containing extracted .bzn files")
@@ -8964,13 +10046,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--outdir", required=True, help="Output folder for exported terrain images and manifest")
     pa.add_argument(
         "--start",
-        default=f"0x{BZ64_DEFAULT_TERRAIN_RANGE[0]:08X}",
-        help=f"Start ROM offset (hex or int, default: 0x{BZ64_DEFAULT_TERRAIN_RANGE[0]:08X})",
+        help="Start ROM offset (hex or int). Omit to scan from ROM start.",
     )
     pa.add_argument(
         "--end",
-        default=f"0x{BZ64_DEFAULT_TERRAIN_RANGE[1]:08X}",
-        help=f"End ROM offset (hex or int, default: 0x{BZ64_DEFAULT_TERRAIN_RANGE[1]:08X})",
+        help="End ROM offset (hex or int). Omit to scan through ROM end.",
     )
     pa.add_argument(
         "--u16-dims",

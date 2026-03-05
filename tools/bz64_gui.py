@@ -95,6 +95,11 @@ class ArgField:
             ),
         )
 
+    @staticmethod
+    def _is_empty_like_text(text: str) -> bool:
+        t = str(text).strip().lower()
+        return t in {"", "[]", "none", "null", "{}", "()"}
+
     def render(
         self,
         parent: tk.Widget,
@@ -187,7 +192,7 @@ class ArgField:
             return []
 
         s = str(self.value_var.get()).strip()
-        if not s:
+        if self._is_empty_like_text(s):
             return []
 
         # Positional arguments do not include the argument name in argv.
@@ -198,15 +203,35 @@ class ArgField:
         # Append actions accept repeated flags; support comma/semicolon/newline list.
         if isinstance(self.action, argparse._AppendAction):
             vals: List[str] = []
-            for part in s.replace(";", "\n").splitlines():
-                seg = part.strip()
-                if seg:
+            if s.startswith("[") and s.endswith("]"):
+                # Accept JSON-like saved values from previous GUI configs.
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        for part in parsed:
+                            seg = str(part).strip()
+                            if self._is_empty_like_text(seg):
+                                continue
+                            vals.append(seg)
+                except Exception:
+                    pass
+            if not vals:
+                for part in s.replace(";", "\n").splitlines():
+                    seg = part.strip()
+                    if self._is_empty_like_text(seg):
+                        continue
                     vals.append(seg)
             out: List[str] = []
             for v in vals:
-                out.extend([opt, v])
+                if v.startswith("-"):
+                    out.append(f"{opt}={v}")
+                else:
+                    out.extend([opt, v])
             return out
 
+        if s.startswith("-"):
+            # Prevent argparse from treating negative-like strings as new options.
+            return [f"{opt}={s}"]
         return [opt, s]
 
 
@@ -606,6 +631,21 @@ class BZ64GUI:
                 midi_cfg["end"] = "0x00C054A8"
             if not str(midi_cfg.get("game_name", "")).strip():
                 midi_cfg["game_name"] = "Battlezone - Rise of the Black Dogs (U)"
+
+        terrain_cfg = self.command_states.get("terrain-all")
+        if isinstance(terrain_cfg, dict):
+            s_raw = str(terrain_cfg.get("start", "")).strip()
+            e_raw = str(terrain_cfg.get("end", "")).strip()
+            try:
+                s_val = int(s_raw, 0) if s_raw else None
+                e_val = int(e_raw, 0) if e_raw else None
+            except Exception:
+                s_val = None
+                e_val = None
+            # Clear legacy defaults that were previously auto-filled by parser defaults.
+            if s_val == 0x00928128 and e_val == 0x0097056A:
+                terrain_cfg["start"] = ""
+                terrain_cfg["end"] = ""
 
     def _build_argv(self) -> List[str]:
         cmd = self.cmd_var.get().strip()
